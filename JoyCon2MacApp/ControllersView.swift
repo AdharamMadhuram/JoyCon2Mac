@@ -50,13 +50,14 @@ struct ControllersView: View {
 }
 
 struct ControllerCard: View {
-    @ObservedObject var controller: Controller
+    let controller: ControllerState
 
     private var batteryPercentage: Double {
         if controller.batteryPercentage >= 0 {
-            // Joy-Con 2 reports a raw charge level. On a fully charged unit
-            // it typically sits near 88-90, so treat that top band as full
-            // instead of showing a false partial charge.
+            // Joy2Win uses the raw level at packet bytes 31/32, but on this
+            // hardware a charge-grip-full controller commonly reports about
+            // 89-90. Treat that top band as full instead of showing a false
+            // partial charge.
             if controller.batteryPercentage >= 88 {
                 return 100
             }
@@ -95,8 +96,8 @@ struct ControllerCard: View {
 
     private var statusColor: Color {
         switch controller.status {
-        case "ready", "streaming": return .green
-        case "bleConnected", "servicesReady", "initializing", "connecting", "queued": return .blue
+        case "ready": return .green
+        case "streaming", "bleConnected", "servicesReady", "initializing", "connecting", "queued": return .blue
         case "commandTimeout": return .orange
         case "connectFailed", "writeFailed", "disconnected", "daemonStopped": return .red
         default: return controller.isConnected ? .green : .secondary
@@ -116,7 +117,6 @@ struct ControllerCard: View {
                     Text(controller.macAddress)
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .lineLimit(1)
                 }
 
                 Spacer()

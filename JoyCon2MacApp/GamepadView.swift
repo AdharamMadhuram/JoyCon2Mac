@@ -3,28 +3,37 @@ import SwiftUI
 struct GamepadView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
 
-    private var leftController: Controller? {
+    private var leftController: ControllerState? {
         daemonBridge.controllers.first { $0.side == "left" }
     }
 
-    private var rightController: Controller? {
+    private var rightController: ControllerState? {
         daemonBridge.controllers.first { $0.side == "right" }
+    }
+
+    private var primaryController: ControllerState? {
+        leftController ?? rightController ?? daemonBridge.controllers.first
+    }
+
+    private var leftButtons: UInt32 {
+        leftController?.leftButtons ?? primaryController?.leftButtons ?? 0
+    }
+
+    private var rightButtons: UInt32 {
+        rightController?.rightButtons ?? primaryController?.rightButtons ?? 0
     }
 
     var body: some View {
         Group {
-            if leftController == nil && rightController == nil {
+            if primaryController == nil {
                 emptyState
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        if let left = leftController {
-                            LeftGamepadSection(controller: left)
-                        }
-                        if let right = rightController {
-                            RightGamepadSection(controller: right)
-                        }
-                        CombinedFooter(left: leftController, right: rightController)
+                        controllerSurface
+                        shoulderSection
+                        railButtons
+                        systemButtons
                     }
                     .padding(20)
                 }
@@ -43,227 +52,177 @@ struct GamepadView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-}
 
-// MARK: - Left Joy-Con
-
-private struct LeftGamepadSection: View {
-    @ObservedObject var controller: Controller
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private var controllerSurface: some View {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Image(systemName: "l.circle.fill").foregroundColor(.blue)
-                Text("Left Joy-Con").font(.headline)
+                Text("Combined Output")
+                    .font(.headline)
                 Spacer()
-                Text("Packets \(controller.packetCount)")
+                Text(connectionSummary)
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .monospacedDigit()
             }
 
-            HStack(alignment: .center, spacing: 32) {
-                VStack(spacing: 14) {
-                    DpadCluster(buttons: controller.leftButtons)
-                    StickIndicator(
-                        title: "Left Stick",
-                        x: controller.leftStickX,
-                        y: controller.leftStickY,
-                        color: .blue
-                    )
-                }
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                Spacer()
+                HStack(alignment: .center, spacing: 42) {
+                    VStack(spacing: 18) {
+                        dpad
+                        StickIndicator(
+                            title: "Left Stick",
+                            x: leftController?.leftStickX ?? primaryController?.leftStickX ?? 0,
+                            y: leftController?.leftStickY ?? primaryController?.leftStickY ?? 0,
+                            color: .blue
+                        )
+                    }
 
-                VStack(alignment: .leading, spacing: 10) {
-                    shoulderRow(label: "L", mask: 0x0040, analog: controller.triggerL)
-                    shoulderRow(label: "ZL", mask: 0x0080, analog: nil)
-                    Divider().frame(maxWidth: 160)
-                    smallButton(label: "SL", mask: 0x0020)
-                    smallButton(label: "SR", mask: 0x0010)
-                    smallButton(label: "L3", mask: 0x0800)
-                    Divider().frame(maxWidth: 160)
-                    smallButton(label: "−", mask: 0x0100)
-                    smallButton(label: "Capture", mask: 0x2000)
+                    Spacer()
+
+                    VStack(spacing: 18) {
+                        faceButtons
+                        StickIndicator(
+                            title: "Right Stick",
+                            x: rightController?.rightStickX ?? primaryController?.rightStickX ?? 0,
+                            y: rightController?.rightStickY ?? primaryController?.rightStickY ?? 0,
+                            color: .green
+                        )
+                    }
                 }
+                .padding(28)
             }
+            .frame(minHeight: 330)
         }
-        .padding(16)
-        .background(Color(NSColor.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
-    @ViewBuilder
-    private func shoulderRow(label: String, mask: UInt32, analog: UInt8?) -> some View {
-        HStack(spacing: 10) {
-            ButtonIndicator(
-                isPressed: (controller.leftButtons & mask) != 0,
-                label: label,
-                color: .purple
+    private var dpad: some View {
+        VStack(spacing: 5) {
+            ButtonIndicator(isPressed: leftButtons & 0x0002 != 0, label: "↑")
+            HStack(spacing: 5) {
+                ButtonIndicator(isPressed: leftButtons & 0x0008 != 0, label: "←")
+                Color.clear.frame(width: 34, height: 34)
+                ButtonIndicator(isPressed: leftButtons & 0x0004 != 0, label: "→")
+            }
+            ButtonIndicator(isPressed: leftButtons & 0x0001 != 0, label: "↓")
+        }
+    }
+
+    private var faceButtons: some View {
+        VStack(spacing: 5) {
+            ButtonIndicator(isPressed: rightButtons & 0x000200 != 0, label: "X", color: .blue)
+            HStack(spacing: 5) {
+                ButtonIndicator(isPressed: rightButtons & 0x000100 != 0, label: "Y", color: .green)
+                Color.clear.frame(width: 34, height: 34)
+                ButtonIndicator(isPressed: rightButtons & 0x000800 != 0, label: "A", color: .red)
+            }
+            ButtonIndicator(isPressed: rightButtons & 0x000400 != 0, label: "B", color: .yellow)
+        }
+    }
+
+    private var shoulderSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            ShoulderGroup(
+                title: "Left Shoulder",
+                primaryLabel: "L",
+                primaryPressed: leftButtons & 0x0040 != 0,
+                secondaryLabel: "ZL",
+                secondaryPressed: leftButtons & 0x0080 != 0,
+                triggerValue: leftController?.triggerL ?? primaryController?.triggerL ?? 0
             )
-            if let analog {
-                ProgressView(value: Double(analog), total: 255)
-                    .frame(maxWidth: 120)
-                Text("\(analog)")
-                    .font(.caption)
-                    .monospacedDigit()
-                    .foregroundColor(.secondary)
-            }
+
+            ShoulderGroup(
+                title: "Right Shoulder",
+                primaryLabel: "R",
+                primaryPressed: rightButtons & 0x004000 != 0,
+                secondaryLabel: "ZR",
+                secondaryPressed: rightButtons & 0x008000 != 0,
+                triggerValue: rightController?.triggerR ?? primaryController?.triggerR ?? 0
+            )
         }
     }
 
-    @ViewBuilder
-    private func smallButton(label: String, mask: UInt32) -> some View {
-        ButtonIndicator(
-            isPressed: (controller.leftButtons & mask) != 0,
-            label: label,
-            color: .gray
-        )
-    }
-}
-
-// MARK: - Right Joy-Con
-
-private struct RightGamepadSection: View {
-    @ObservedObject var controller: Controller
-
-    var body: some View {
+    private var railButtons: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "r.circle.fill").foregroundColor(.red)
-                Text("Right Joy-Con").font(.headline)
-                Spacer()
-                Text("Packets \(controller.packetCount)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .monospacedDigit()
-            }
+            Text("Side Rail Buttons")
+                .font(.headline)
 
-            HStack(alignment: .center, spacing: 32) {
-                VStack(spacing: 14) {
-                    FaceButtons(buttons: controller.rightButtons)
-                    StickIndicator(
-                        title: "Right Stick",
-                        x: controller.rightStickX,
-                        y: controller.rightStickY,
-                        color: .green
-                    )
-                }
-
-                Spacer()
-
-                VStack(alignment: .leading, spacing: 10) {
-                    shoulderRow(label: "R", mask: 0x004000, analog: controller.triggerR)
-                    shoulderRow(label: "ZR", mask: 0x008000, analog: nil)
-                    Divider().frame(maxWidth: 160)
-                    smallButton(label: "SL", mask: 0x002000)
-                    smallButton(label: "SR", mask: 0x001000)
-                    smallButton(label: "R3", mask: 0x000004)
-                    Divider().frame(maxWidth: 160)
-                    smallButton(label: "+", mask: 0x000002)
-                    smallButton(label: "Home", mask: 0x000010)
-                    // Switch 2 introduced the Chat / C button on the Right Joy-Con.
-                    // joycon2cpp treats mask 0x000040 as the Chat/C press; this
-                    // is the same bit that used to mean "R" on Switch 1 right.
-                    smallButton(label: "Chat (C)", mask: 0x000040)
-                }
+            HStack(spacing: 12) {
+                ButtonIndicator(isPressed: leftButtons & 0x0020 != 0, label: "SL L", color: .purple)
+                ButtonIndicator(isPressed: leftButtons & 0x0010 != 0, label: "SR L", color: .purple)
+                ButtonIndicator(isPressed: rightButtons & 0x002000 != 0, label: "SL R", color: .blue)
+                ButtonIndicator(isPressed: rightButtons & 0x001000 != 0, label: "SR R", color: .blue)
             }
         }
-        .padding(16)
+        .padding(14)
         .background(Color(NSColor.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-    }
-
-    @ViewBuilder
-    private func shoulderRow(label: String, mask: UInt32, analog: UInt8?) -> some View {
-        HStack(spacing: 10) {
-            ButtonIndicator(
-                isPressed: (controller.rightButtons & mask) != 0,
-                label: label,
-                color: .purple
-            )
-            if let analog {
-                ProgressView(value: Double(analog), total: 255)
-                    .frame(maxWidth: 120)
-                Text("\(analog)")
-                    .font(.caption)
-                    .monospacedDigit()
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func smallButton(label: String, mask: UInt32) -> some View {
-        ButtonIndicator(
-            isPressed: (controller.rightButtons & mask) != 0,
-            label: label,
-            color: .gray
-        )
-    }
-}
-
-// MARK: - Combined footer
-
-private struct CombinedFooter: View {
-    let left: Controller?
-    let right: Controller?
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "link")
-            Text("Combined Gamepad HID")
-                .font(.subheadline)
-                .fontWeight(.medium)
-            Spacer()
-            Text(summary)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .monospacedDigit()
-        }
-        .padding(12)
-        .background(Color(NSColor.windowBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var summary: String {
-        let leftPackets = left.map(\.packetCount).map { "L \($0)" } ?? "L missing"
-        let rightPackets = right.map(\.packetCount).map { "R \($0)" } ?? "R missing"
-        return "\(leftPackets) · \(rightPackets)"
+    private var systemButtons: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("System Buttons")
+                .font(.headline)
+
+            HStack(spacing: 12) {
+                ButtonIndicator(isPressed: leftButtons & 0x0100 != 0, label: "−", color: .gray)
+                ButtonIndicator(isPressed: rightButtons & 0x000002 != 0, label: "+", color: .gray)
+                ButtonIndicator(isPressed: leftButtons & 0x2000 != 0, label: "CAP", color: .gray)
+                ButtonIndicator(isPressed: rightButtons & 0x000010 != 0, label: "HOME", color: .gray)
+                ButtonIndicator(isPressed: leftButtons & 0x0800 != 0, label: "L3", color: .gray)
+                ButtonIndicator(isPressed: rightButtons & 0x000004 != 0, label: "R3", color: .gray)
+            }
+        }
+        .padding(14)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var connectionSummary: String {
+        let left = leftController.map { "L \($0.packetCount)" } ?? "L missing"
+        let right = rightController.map { "R \($0.packetCount)" } ?? "R missing"
+        return "\(left) · \(right)"
     }
 }
 
-// MARK: - D-pad and face buttons
-
-private struct DpadCluster: View {
-    let buttons: UInt32
-
-    var body: some View {
-        VStack(spacing: 5) {
-            ButtonIndicator(isPressed: buttons & 0x0002 != 0, label: "↑")
-            HStack(spacing: 5) {
-                ButtonIndicator(isPressed: buttons & 0x0008 != 0, label: "←")
-                Color.clear.frame(width: 34, height: 34)
-                ButtonIndicator(isPressed: buttons & 0x0004 != 0, label: "→")
-            }
-            ButtonIndicator(isPressed: buttons & 0x0001 != 0, label: "↓")
-        }
-    }
-}
-
-private struct FaceButtons: View {
-    let buttons: UInt32
+private struct ShoulderGroup: View {
+    let title: String
+    let primaryLabel: String
+    let primaryPressed: Bool
+    let secondaryLabel: String
+    let secondaryPressed: Bool
+    let triggerValue: UInt8
 
     var body: some View {
-        VStack(spacing: 5) {
-            ButtonIndicator(isPressed: buttons & 0x000200 != 0, label: "X", color: .blue)
-            HStack(spacing: 5) {
-                ButtonIndicator(isPressed: buttons & 0x000100 != 0, label: "Y", color: .green)
-                Color.clear.frame(width: 34, height: 34)
-                ButtonIndicator(isPressed: buttons & 0x000800 != 0, label: "A", color: .red)
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.headline)
+
+            HStack(spacing: 12) {
+                ButtonIndicator(isPressed: primaryPressed, label: primaryLabel, color: .purple)
+                ButtonIndicator(isPressed: secondaryPressed, label: secondaryLabel, color: .purple)
             }
-            ButtonIndicator(isPressed: buttons & 0x000400 != 0, label: "B", color: .yellow)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("Analog")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text("\(triggerValue)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                ProgressView(value: Double(triggerValue), total: 255)
+            }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -311,18 +270,18 @@ struct ButtonIndicator: View {
 
     var body: some View {
         Text(label)
-            .font(.system(size: label.count > 4 ? 10 : 13, weight: .semibold))
+            .font(.system(size: label.count > 3 ? 10 : 13, weight: .semibold))
             .foregroundColor(isPressed ? .white : .secondary)
             .lineLimit(1)
             .minimumScaleFactor(0.6)
-            .frame(width: 52, height: 30)
+            .frame(width: 38, height: 38)
             .background(isPressed ? color : Color.secondary.opacity(0.18))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .clipShape(Circle())
     }
 }
 
 #Preview {
     GamepadView()
         .environmentObject(DaemonBridge.shared)
-        .frame(width: 900, height: 700)
+        .frame(width: 800, height: 600)
 }

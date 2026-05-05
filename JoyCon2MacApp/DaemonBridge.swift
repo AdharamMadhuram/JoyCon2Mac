@@ -3,6 +3,40 @@ import Combine
 import AppKit
 import Darwin
 
+struct ControllerState: Identifiable {
+    let id: String
+    var side: String
+    var name: String
+    var macAddress: String
+    var isConnected: Bool
+    var status: String
+    var batteryVoltage: Double
+    var batteryCurrent: Double
+    var batteryTemperature: Double
+    var batteryPercentage: Double
+    var buttons: UInt32
+    var leftButtons: UInt32
+    var rightButtons: UInt32
+    var leftStickX: Int16
+    var leftStickY: Int16
+    var rightStickX: Int16
+    var rightStickY: Int16
+    var gyroX: Double
+    var gyroY: Double
+    var gyroZ: Double
+    var accelX: Double
+    var accelY: Double
+    var accelZ: Double
+    var mouseX: Int16
+    var mouseY: Int16
+    var mouseDistance: Int16
+    var triggerL: UInt8
+    var triggerR: UInt8
+    var packetCount: UInt32
+    var mouseMode: MouseMode
+    var rssi: Int
+}
+
 enum MouseMode: Int {
     case off = 0
     case slow = 1
@@ -28,57 +62,6 @@ enum MouseMode: Int {
     }
 }
 
-// Per-controller state object. Views bind only to the controller they care
-// about, so a high-frequency update on the left Joy-Con no longer invalidates
-// everything listening to DaemonBridge. This is what was freezing the UI.
-final class Controller: ObservableObject, Identifiable {
-    let id: String
-    @Published var side: String
-    @Published var name: String
-    @Published var macAddress: String
-    @Published var isConnected: Bool = false
-    @Published var status: String = "scanning"
-    @Published var batteryVoltage: Double = 0
-    @Published var batteryCurrent: Double = 0
-    @Published var batteryTemperature: Double = 0
-    @Published var batteryPercentage: Double = -1
-    @Published var buttons: UInt32 = 0
-    @Published var leftButtons: UInt32 = 0
-    @Published var rightButtons: UInt32 = 0
-    @Published var leftStickX: Int16 = 0
-    @Published var leftStickY: Int16 = 0
-    @Published var rightStickX: Int16 = 0
-    @Published var rightStickY: Int16 = 0
-    @Published var gyroX: Double = 0
-    @Published var gyroY: Double = 0
-    @Published var gyroZ: Double = 0
-    @Published var accelX: Double = 0
-    @Published var accelY: Double = 0
-    @Published var accelZ: Double = 0
-    @Published var mouseX: Int16 = 0
-    @Published var mouseY: Int16 = 0
-    @Published var mouseDistance: Int16 = 0
-    @Published var triggerL: UInt8 = 0
-    @Published var triggerR: UInt8 = 0
-    @Published var packetCount: UInt32 = 0
-    @Published var mouseMode: MouseMode = .off
-    @Published var rssi: Int = 0
-
-    // Raw floats for stick visualisation (already deadzoned and clamped by
-    // the decoder). Views use these directly instead of re-dividing.
-    var leftStickFloatX: Double { Double(leftStickX) / 32767.0 }
-    var leftStickFloatY: Double { Double(leftStickY) / 32767.0 }
-    var rightStickFloatX: Double { Double(rightStickX) / 32767.0 }
-    var rightStickFloatY: Double { Double(rightStickY) / 32767.0 }
-
-    init(side: String) {
-        self.id = side
-        self.side = side
-        self.name = side == "right" ? "Joy-Con R" : "Joy-Con L"
-        self.macAddress = side == "right" ? "Right BLE peripheral" : "Left BLE peripheral"
-    }
-}
-
 struct NFCTag: Identifiable {
     let id = UUID()
     var uid: String
@@ -87,23 +70,37 @@ struct NFCTag: Identifiable {
     var timestamp: Date
 }
 
+// DaemonBridge owns two kinds of state:
+//  1. Hot state (controllers, NFC tags) – published, but mutated at most
+//     15 Hz per controller so SwiftUI stays responsive.
+//  2. Log/telemetry noise – NOT published here. Lives on TelemetryStore so
+//     the 100+ lines/sec firehose cannot invalidate controller views.
 class DaemonBridge: ObservableObject {
     static let shared = DaemonBridge()
 
-    // List of controllers is @Published only for add/remove; individual
-    // per-controller state lives on each Controller object so a 120 Hz
-    // packet stream does not invalidate the whole app.
-    @Published var controllers: [Controller] = []
+    @Published var controllers: [ControllerState] = []
     @Published var nfcTags: [NFCTag] = []
     @Published var isDaemonRunning = false
+    // Kept for source-compat with existing views. These strings are NOT mutated
+    // from the packet firehose anymore; they are updated only on state
+    // transitions (daemon start/stop, driver install result).
+    @Published var daemonOutput: String = ""
+    @Published var telemetryLines: [String] = []
+    @Published var driverInstallStatus: String = ""
+    @Published var stateRevision: UInt64 = 0
 
     private var daemonProcess: Process?
     private var daemonApplication: NSRunningApplication?
     private var outputPipe: Pipe?
     private var pendingOutput = ""
+    // Per-controller rate limiter. 15 Hz is plenty for a live UI and a lot
+    // gentler on SwiftUI than the ~120 Hz the daemon actually publishes.
     private var lastControllerUpdate: [String: Date] = [:]
+    private let controllerUpdateInterval: TimeInterval = 1.0 / 15.0
     private var shouldRestartAfterTermination = false
     private var logPollTimer: Timer?
+    private var daemonLogPath: URL?
+    private var daemonLogOffset: UInt64 = 0
 
     private init() {
         startDaemon()
@@ -219,9 +216,9 @@ class DaemonBridge: ObservableObject {
             try FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
             let logPath = supportDir.appendingPathComponent("daemon.jsonl")
             try Data().write(to: logPath, options: .atomic)
-            TelemetryStore.shared.setLogPath(logPath)
             daemonLogPath = logPath
             daemonLogOffset = 0
+            TelemetryStore.shared.setLogPath(logPath)
             controllers.removeAll()
             lastControllerUpdate.removeAll()
 
@@ -307,11 +304,6 @@ class DaemonBridge: ObservableObject {
         }
     }
 
-    // MARK: - Daemon log tailing (helper app writes JSON Lines to disk)
-
-    private var daemonLogPath: URL?
-    private var daemonLogOffset: UInt64 = 0
-
     private func startLogPolling() {
         logPollTimer?.invalidate()
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -360,7 +352,11 @@ class DaemonBridge: ObservableObject {
     func toggleMouseMode() {
         if let controller = controllers.first {
             let nextRaw = (controller.mouseMode.rawValue + 1) % 4
-            controller.mouseMode = MouseMode(rawValue: nextRaw) ?? .off
+            let newMode = MouseMode(rawValue: nextRaw) ?? .off
+            var updated = controllers
+            updated[0].mouseMode = newMode
+            controllers = updated
+            bumpStateRevision()
         }
     }
 
@@ -382,6 +378,9 @@ class DaemonBridge: ObservableObject {
 
     func clearTelemetryView() {
         TelemetryStore.shared.clear()
+        // Kept-for-compat fields — also flush to keep any legacy bindings happy.
+        daemonOutput = ""
+        telemetryLines.removeAll()
     }
 
     func installAndLoadDriver() {
@@ -393,16 +392,20 @@ class DaemonBridge: ObservableObject {
 
         guard FileManager.default.fileExists(atPath: embeddedDextURL.path) else {
             let msg = "Driver extension is missing from Contents/Library/SystemExtensions."
+            driverInstallStatus = msg
             TelemetryStore.shared.updateDriverStatus(msg)
             TelemetryStore.shared.append(msg)
             return
         }
 
-        TelemetryStore.shared.updateDriverStatus("Submitting driver activation request...")
+        let initial = "Submitting driver activation request..."
+        driverInstallStatus = initial
+        TelemetryStore.shared.updateDriverStatus(initial)
         TelemetryStore.shared.append("Activating DriverKit extension from \(embeddedDextURL.path)")
 
         DriverExtensionInstaller.shared.activate { [weak self] status, shouldRestartDaemon in
             DispatchQueue.main.async {
+                self?.driverInstallStatus = status
                 TelemetryStore.shared.updateDriverStatus(status)
                 TelemetryStore.shared.append("[driver] \(status)")
                 if shouldRestartDaemon {
@@ -411,8 +414,6 @@ class DaemonBridge: ObservableObject {
             }
         }
     }
-
-    // MARK: - Output parsing
 
     private func parseDaemonOutput(_ output: String) {
         pendingOutput += output
@@ -453,10 +454,13 @@ class DaemonBridge: ObservableObject {
     }
 
     private func markControllersDisconnected(status: String) {
-        for controller in controllers {
-            controller.isConnected = false
-            controller.status = status
+        var updated = controllers
+        for index in updated.indices {
+            updated[index].isConnected = false
+            updated[index].status = status
         }
+        controllers = updated
+        bumpStateRevision()
     }
 
     private func handleDaemonTerminated() {
@@ -492,6 +496,7 @@ class DaemonBridge: ObservableObject {
         let detail = stringValue(object["detail"], default: "")
         let name = stringValue(object["name"], default: "")
         let line = "[\(side)] \(phase)\(name.isEmpty ? "" : " \(name)")\(detail.isEmpty ? "" : " - \(detail)")"
+        // Firehose goes only to TelemetryStore now. No publisher invalidation on DaemonBridge.
         TelemetryStore.shared.append(line)
     }
 
@@ -522,74 +527,126 @@ class DaemonBridge: ObservableObject {
         return statusRank(incoming) >= statusRank(current)
     }
 
-    private func getOrCreateController(side: String) -> Controller {
-        if let existing = controllers.first(where: { $0.id == side }) {
-            return existing
-        }
-        let controller = Controller(side: side)
-        controllers.append(controller)
-        controllers.sort { $0.id < $1.id }
-        return controller
-    }
-
     private func updateController(from object: [String: Any]) {
         let side = stringValue(object["side"], default: "left")
         let normalizedSide = side == "right" ? "right" : "left"
         let now = Date()
         if let lastUpdate = lastControllerUpdate[normalizedSide],
-           now.timeIntervalSince(lastUpdate) < 0.033 {
-            // ~30 fps cap, per-side. Enough to feel live but light on SwiftUI.
+           now.timeIntervalSince(lastUpdate) < controllerUpdateInterval {
             return
         }
         lastControllerUpdate[normalizedSide] = now
-        let controller = getOrCreateController(side: normalizedSide)
-        // Upgrade the status to streaming/ready if state packets are flowing.
-        if controller.status != "ready" {
-            controller.status = "streaming"
+        let currentStatus = controllers.first(where: { $0.id == normalizedSide })?.status
+        let dataStatus = currentStatus == "ready" ? "ready" : (currentStatus ?? "streaming")
+
+        let controller = ControllerState(
+            id: normalizedSide,
+            side: normalizedSide,
+            name: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L",
+            macAddress: normalizedSide == "right" ? "Right BLE peripheral" : "Left BLE peripheral",
+            isConnected: true,
+            status: dataStatus,
+            batteryVoltage: doubleValue(object["batteryVoltage"]),
+            batteryCurrent: doubleValue(object["batteryCurrent"]),
+            batteryTemperature: doubleValue(object["batteryTemperature"]),
+            batteryPercentage: doubleValue(object["batteryPercentage"], default: -1),
+            buttons: uint32Value(object["buttons"]),
+            leftButtons: uint32Value(object["leftButtons"]),
+            rightButtons: uint32Value(object["rightButtons"]),
+            leftStickX: int16Value(object["leftStickX"]),
+            leftStickY: int16Value(object["leftStickY"]),
+            rightStickX: int16Value(object["rightStickX"]),
+            rightStickY: int16Value(object["rightStickY"]),
+            gyroX: doubleValue(object["gyroX"]),
+            gyroY: doubleValue(object["gyroY"]),
+            gyroZ: doubleValue(object["gyroZ"]),
+            accelX: doubleValue(object["accelX"]),
+            accelY: doubleValue(object["accelY"]),
+            accelZ: doubleValue(object["accelZ"]),
+            mouseX: int16Value(object["mouseX"]),
+            mouseY: int16Value(object["mouseY"]),
+            mouseDistance: int16Value(object["mouseDistance"]),
+            triggerL: uint8Value(object["triggerL"]),
+            triggerR: uint8Value(object["triggerR"]),
+            packetCount: uint32Value(object["packetCount"]),
+            mouseMode: MouseMode(rawValue: intValue(object["mouseMode"])) ?? .off,
+            rssi: intValue(object["rssi"], default: 0)
+        )
+
+        var updated = controllers
+        if let index = updated.firstIndex(where: { $0.id == controller.id }) {
+            updated[index] = controller
+        } else {
+            updated.append(controller)
+            updated.sort { $0.id < $1.id }
         }
-        controller.isConnected = true
-        controller.batteryVoltage = doubleValue(object["batteryVoltage"])
-        controller.batteryCurrent = doubleValue(object["batteryCurrent"])
-        controller.batteryTemperature = doubleValue(object["batteryTemperature"])
-        controller.batteryPercentage = doubleValue(object["batteryPercentage"], default: -1)
-        controller.buttons = uint32Value(object["buttons"])
-        controller.leftButtons = uint32Value(object["leftButtons"])
-        controller.rightButtons = uint32Value(object["rightButtons"])
-        controller.leftStickX = int16Value(object["leftStickX"])
-        controller.leftStickY = int16Value(object["leftStickY"])
-        controller.rightStickX = int16Value(object["rightStickX"])
-        controller.rightStickY = int16Value(object["rightStickY"])
-        controller.gyroX = doubleValue(object["gyroX"])
-        controller.gyroY = doubleValue(object["gyroY"])
-        controller.gyroZ = doubleValue(object["gyroZ"])
-        controller.accelX = doubleValue(object["accelX"])
-        controller.accelY = doubleValue(object["accelY"])
-        controller.accelZ = doubleValue(object["accelZ"])
-        controller.mouseX = int16Value(object["mouseX"])
-        controller.mouseY = int16Value(object["mouseY"])
-        controller.mouseDistance = int16Value(object["mouseDistance"])
-        controller.triggerL = uint8Value(object["triggerL"])
-        controller.triggerR = uint8Value(object["triggerR"])
-        controller.packetCount = uint32Value(object["packetCount"])
-        controller.mouseMode = MouseMode(rawValue: intValue(object["mouseMode"])) ?? .off
-        controller.rssi = intValue(object["rssi"], default: 0)
+        controllers = updated
+        bumpStateRevision()
     }
 
     private func updateControllerStatus(from object: [String: Any]) {
         let side = stringValue(object["side"], default: "left")
         let normalizedSide = side == "right" ? "right" : "left"
         let rawStatus = stringValue(object["status"], default: "scanning")
+        let name = stringValue(
+            object["name"],
+            default: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L"
+        )
         let message = stringValue(object["message"], default: "")
         let connectedStatuses = ["bleConnected", "servicesReady", "initializing", "ready", "streaming", "commandTimeout"]
         let isConnected = connectedStatuses.contains(rawStatus)
 
-        let controller = getOrCreateController(side: normalizedSide)
-        controller.isConnected = isConnected
-        if shouldReplaceStatus(current: controller.status, incoming: rawStatus) {
-            controller.status = rawStatus
-        }
-        if !message.isEmpty {
-            controller.macAddress = message
+        var updated = controllers
+        if let index = updated.firstIndex(where: { $0.id == normalizedSide }) {
+            updated[index].isConnected = isConnected
+            if shouldReplaceStatus(current: updated[index].status, incoming: rawStatus) {
+                updated[index].status = rawStatus
+            }
+            if !name.isEmpty {
+                updated[index].name = normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L"
+                updated[index].macAddress = message.isEmpty ? name : message
+            }
+            controllers = updated
+            bumpStateRevision()
+        } else {
+            updated.append(
+                ControllerState(
+                    id: normalizedSide,
+                    side: normalizedSide,
+                    name: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L",
+                    macAddress: message.isEmpty ? name : message,
+                    isConnected: isConnected,
+                    status: rawStatus,
+                    batteryVoltage: 0,
+                    batteryCurrent: 0,
+                    batteryTemperature: 0,
+                    batteryPercentage: -1,
+                    buttons: 0,
+                    leftButtons: 0,
+                    rightButtons: 0,
+                    leftStickX: 0,
+                    leftStickY: 0,
+                    rightStickX: 0,
+                    rightStickY: 0,
+                    gyroX: 0,
+                    gyroY: 0,
+                    gyroZ: 0,
+                    accelX: 0,
+                    accelY: 0,
+                    accelZ: 0,
+                    mouseX: 0,
+                    mouseY: 0,
+                    mouseDistance: 0,
+                    triggerL: 0,
+                    triggerR: 0,
+                    packetCount: 0,
+                    mouseMode: .off,
+                    rssi: 0
+                )
+            )
+            updated.sort { $0.id < $1.id }
+            controllers = updated
+            bumpStateRevision()
         }
     }
 
@@ -638,5 +695,9 @@ class DaemonBridge: ObservableObject {
         if let value = value as? NSNumber { return value.doubleValue }
         if let value = value as? String { return Double(value) ?? defaultValue }
         return defaultValue
+    }
+
+    private func bumpStateRevision() {
+        stateRevision &+= 1
     }
 }

@@ -20,17 +20,6 @@ private enum AppSection: String, CaseIterable, Identifiable {
         case .settings: return "gearshape"
         }
     }
-
-    var subtitle: String {
-        switch self {
-        case .controllers: return "Bluetooth connection, battery, and packet status"
-        case .gamepad: return "Combined HID gamepad report"
-        case .mouse: return "Optical sensor mouse output"
-        case .gyro: return "IMU motion telemetry"
-        case .nfc: return "Vendor NFC report stream"
-        case .settings: return "Driver and app preferences"
-        }
-    }
 }
 
 struct MainWindow: View {
@@ -39,12 +28,12 @@ struct MainWindow: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            Sidebar(selected: $selectedSection)
+            sidebar
 
             Divider()
 
             VStack(spacing: 0) {
-                TopBar(selected: selectedSection)
+                topBar
                 Divider()
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -52,6 +41,96 @@ struct MainWindow: View {
             .background(Color(NSColor.windowBackgroundColor))
         }
         .frame(minWidth: 960, minHeight: 640)
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "gamecontroller.fill")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("JoyCon2Mac")
+                        .font(.headline)
+                    Text("Local Driver")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+
+            VStack(spacing: 4) {
+                ForEach(AppSection.allCases) { section in
+                    Button {
+                        selectedSection = section
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: section.icon)
+                                .frame(width: 20)
+                            Text(section.rawValue)
+                            Spacer()
+                        }
+                        .font(.system(size: 14, weight: selectedSection == section ? .semibold : .regular))
+                        .foregroundColor(selectedSection == section ? .primary : .secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(selectedSection == section ? Color.accentColor.opacity(0.16) : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+
+            Spacer()
+
+            VStack(alignment: .leading, spacing: 8) {
+                statusRow(
+                    title: daemonBridge.isDaemonRunning ? "Daemon running" : "Daemon stopped",
+                    color: daemonBridge.isDaemonRunning ? .green : .red
+                )
+                statusRow(
+                    title: "\(connectedControllerCount) active controller\(connectedControllerCount == 1 ? "" : "s")",
+                    color: connectedControllerCount == 0 ? .secondary : .accentColor
+                )
+            }
+            .padding(12)
+        }
+        .frame(width: 190)
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    private var topBar: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(selectedSection.rawValue)
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Text(sectionSubtitle)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                daemonBridge.isDaemonRunning ? daemonBridge.stopDaemon() : daemonBridge.startDaemon()
+            } label: {
+                Label(daemonBridge.isDaemonRunning ? "Stop" : "Start",
+                      systemImage: daemonBridge.isDaemonRunning ? "stop.fill" : "play.fill")
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    private var connectedControllerCount: Int {
+        daemonBridge.controllers.filter { $0.isConnected }.count
     }
 
     @ViewBuilder
@@ -71,64 +150,16 @@ struct MainWindow: View {
             SettingsView()
         }
     }
-}
 
-// Sidebar is deliberately isolated from per-packet daemon state so its hit
-// targets stay responsive. It only reads the controller count and the
-// daemon-running flag, which only flip a few times per session.
-private struct Sidebar: View {
-    @Binding var selected: AppSection
-    @EnvironmentObject var daemonBridge: DaemonBridge
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Image(systemName: "gamecontroller.fill")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundColor(.accentColor)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("JoyCon2Mac")
-                        .font(.headline)
-                    Text("Local Driver")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 14)
-
-            VStack(spacing: 4) {
-                ForEach(AppSection.allCases) { section in
-                    SidebarButton(
-                        section: section,
-                        isSelected: selected == section
-                    ) {
-                        selected = section
-                    }
-                }
-            }
-            .padding(.horizontal, 8)
-
-            Spacer()
-
-            VStack(alignment: .leading, spacing: 8) {
-                statusRow(
-                    title: daemonBridge.isDaemonRunning ? "Daemon running" : "Daemon stopped",
-                    color: daemonBridge.isDaemonRunning ? .green : .red
-                )
-                statusRow(
-                    title: "\(connectedControllerCount) active controller\(connectedControllerCount == 1 ? "" : "s")",
-                    color: connectedControllerCount == 0 ? .secondary : .accentColor
-                )
-            }
-            .padding(12)
+    private var sectionSubtitle: String {
+        switch selectedSection {
+        case .controllers: return "Bluetooth connection, battery, and packet status"
+        case .gamepad: return "Combined HID gamepad report"
+        case .mouse: return "Optical sensor mouse output"
+        case .gyro: return "IMU motion telemetry"
+        case .nfc: return "Vendor NFC report stream"
+        case .settings: return "Driver and app preferences"
         }
-        .frame(width: 200)
-        .background(Color(NSColor.controlBackgroundColor))
-    }
-
-    private var connectedControllerCount: Int {
-        daemonBridge.controllers.filter { $0.isConnected }.count
     }
 
     private func statusRow(title: String, color: Color) -> some View {
@@ -140,64 +171,6 @@ private struct Sidebar: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
-    }
-}
-
-private struct SidebarButton: View {
-    let section: AppSection
-    let isSelected: Bool
-    let onSelect: () -> Void
-
-    var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 10) {
-                Image(systemName: section.icon)
-                    .frame(width: 20)
-                Text(section.rawValue)
-                Spacer()
-            }
-            .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
-            .foregroundColor(isSelected ? .primary : .secondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct TopBar: View {
-    let selected: AppSection
-    @EnvironmentObject var daemonBridge: DaemonBridge
-
-    var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(selected.rawValue)
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Text(selected.subtitle)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            Spacer()
-
-            Button {
-                daemonBridge.isDaemonRunning ? daemonBridge.stopDaemon() : daemonBridge.startDaemon()
-            } label: {
-                Label(daemonBridge.isDaemonRunning ? "Stop" : "Start",
-                      systemImage: daemonBridge.isDaemonRunning ? "stop.fill" : "play.fill")
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
     }
 }
 
