@@ -387,12 +387,32 @@ class DaemonBridge: ObservableObject {
 
     private func parseDaemonOutputOnIngestQueue(_ output: String) {
         // Runs on ingestQueue.
-        pendingOutput += output
+        //
+        // Careful: on bursty input, doing `pendingOutput += output` followed
+        // by repeated `range(of: "\n")` + `removeSubrange(...)` is O(n^2) on
+        // Swift strings. A 50-line batch of ~120-byte JSONL records becomes
+        // ~millions of char copies, which is what was stalling the ingest
+        // queue and occasionally freezing the UI.
+        //
+        // Instead: split the incoming chunk on newlines first (linear), and
+        // only carry the trailing partial line across batches.
+        let combined = pendingOutput + output
+        var lines = combined.components(separatedBy: "\n")
+        // Last element is whatever came after the final '\n' (may be empty
+        // if the daemon flushed a full line, or a partial line mid-write).
+        pendingOutput = lines.removeLast()
 
-        while let newlineRange = pendingOutput.range(of: "\n") {
-            let line = String(pendingOutput[..<newlineRange.lowerBound])
-            pendingOutput.removeSubrange(...newlineRange.lowerBound)
-            parseDaemonLineOnIngestQueue(line.trimmingCharacters(in: .whitespacesAndNewlines))
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                parseDaemonLineOnIngestQueue(trimmed)
+            }
+        }
+
+        // Defensive: if a pathological write left us with a very long
+        // partial line, clamp it rather than let it grow unbounded.
+        if pendingOutput.count > 64 * 1024 {
+            pendingOutput = ""
         }
     }
 
@@ -439,10 +459,12 @@ class DaemonBridge: ObservableObject {
             TelemetryStore.shared.append("[\(side)] \(phase)\(name.isEmpty ? "" : " \(name)")\(detail.isEmpty ? "" : " - \(detail)")")
         case "controller":
             let snapshot = buildControllerStatus(from: object)
-            DispatchQueue.main.async { [weak self] in self?.applyControllerStatus(snapshot) }
+            pendingStatusSnapshots[snapshot.side] = snapshot
+            scheduleMainApplyLocked()
         case "state":
             let snapshot = buildControllerState(from: object)
-            DispatchQueue.main.async { [weak self] in self?.applyControllerState(snapshot) }
+            pendingStateSnapshots[snapshot.id] = snapshot
+            scheduleMainApplyLocked()
         case "nfc":
             guard let uid = object["uid"] as? String else { return }
             let payloadHex = object["payload"] as? String ?? ""
@@ -533,52 +555,94 @@ class DaemonBridge: ObservableObject {
     }
 
     // MARK: - Main-thread appliers
+    //
+    // We coalesce snapshots on the ingest queue into a small dictionary and
+    // flush to the Published array at most every 50 ms. That's 20 Hz UI
+    // refresh — still feels live but caps SwiftUI re-render pressure.
+    private var pendingStateSnapshots: [String: ControllerState] = [:]
+    private var pendingStatusSnapshots: [String: ControllerStatusSnapshot] = [:]
+    private var mainApplyScheduled: Bool = false
+    private let mainApplyInterval: TimeInterval = 0.05
 
-    private func applyControllerState(_ snapshot: ControllerState) {
-        var merged = snapshot
-        if let index = controllers.firstIndex(where: { $0.id == merged.id }) {
-            // Preserve upgraded status like "ready" so it doesn't regress.
-            let existing = controllers[index]
-            if existing.status == "ready" { merged.status = "ready" }
-            controllers[index] = merged
-        } else {
-            controllers.append(merged)
-            controllers.sort { $0.id < $1.id }
+    private func scheduleMainApplyLocked() {
+        // Called on ingestQueue.
+        if mainApplyScheduled { return }
+        mainApplyScheduled = true
+        let deadline = DispatchTime.now() + mainApplyInterval
+        DispatchQueue.main.asyncAfter(deadline: deadline) { [weak self] in
+            self?.flushPendingToMain()
         }
-        stateRevision &+= 1
     }
 
-    private func applyControllerStatus(_ snapshot: ControllerStatusSnapshot) {
-        if let index = controllers.firstIndex(where: { $0.id == snapshot.side }) {
-            controllers[index].isConnected = snapshot.isConnected
-            if shouldReplaceStatus(current: controllers[index].status, incoming: snapshot.status) {
-                controllers[index].status = snapshot.status
-            }
-            if !snapshot.name.isEmpty {
-                controllers[index].name = snapshot.side == "right" ? "Joy-Con R" : "Joy-Con L"
-                controllers[index].macAddress = snapshot.message.isEmpty ? snapshot.name : snapshot.message
-            }
-            stateRevision &+= 1
-        } else {
-            controllers.append(
-                ControllerState(
-                    id: snapshot.side,
-                    side: snapshot.side,
-                    name: snapshot.side == "right" ? "Joy-Con R" : "Joy-Con L",
-                    macAddress: snapshot.message.isEmpty ? snapshot.name : snapshot.message,
-                    isConnected: snapshot.isConnected,
-                    status: snapshot.status,
-                    batteryVoltage: 0, batteryCurrent: 0, batteryTemperature: 0, batteryPercentage: -1,
-                    buttons: 0, leftButtons: 0, rightButtons: 0,
-                    leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0,
-                    gyroX: 0, gyroY: 0, gyroZ: 0,
-                    accelX: 0, accelY: 0, accelZ: 0,
-                    mouseX: 0, mouseY: 0, mouseDistance: 0,
-                    triggerL: 0, triggerR: 0,
-                    packetCount: 0, mouseMode: .off, rssi: 0
+    private func flushPendingToMain() {
+        // Called on main. Move ingest-side pending dicts over in one hop.
+        let (states, statuses): ([String: ControllerState], [String: ControllerStatusSnapshot]) = ingestQueue.sync {
+            let s = pendingStateSnapshots
+            let u = pendingStatusSnapshots
+            pendingStateSnapshots.removeAll(keepingCapacity: true)
+            pendingStatusSnapshots.removeAll(keepingCapacity: true)
+            mainApplyScheduled = false
+            return (s, u)
+        }
+
+        if states.isEmpty && statuses.isEmpty { return }
+
+        var updated = controllers
+        var changed = false
+
+        for (_, status) in statuses {
+            if let index = updated.firstIndex(where: { $0.id == status.side }) {
+                if updated[index].isConnected != status.isConnected {
+                    updated[index].isConnected = status.isConnected
+                    changed = true
+                }
+                if shouldReplaceStatus(current: updated[index].status, incoming: status.status) {
+                    updated[index].status = status.status
+                    changed = true
+                }
+                if !status.name.isEmpty {
+                    updated[index].name = status.side == "right" ? "Joy-Con R" : "Joy-Con L"
+                    updated[index].macAddress = status.message.isEmpty ? status.name : status.message
+                    changed = true
+                }
+            } else {
+                updated.append(
+                    ControllerState(
+                        id: status.side,
+                        side: status.side,
+                        name: status.side == "right" ? "Joy-Con R" : "Joy-Con L",
+                        macAddress: status.message.isEmpty ? status.name : status.message,
+                        isConnected: status.isConnected,
+                        status: status.status,
+                        batteryVoltage: 0, batteryCurrent: 0, batteryTemperature: 0, batteryPercentage: -1,
+                        buttons: 0, leftButtons: 0, rightButtons: 0,
+                        leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0,
+                        gyroX: 0, gyroY: 0, gyroZ: 0,
+                        accelX: 0, accelY: 0, accelZ: 0,
+                        mouseX: 0, mouseY: 0, mouseDistance: 0,
+                        triggerL: 0, triggerR: 0,
+                        packetCount: 0, mouseMode: .off, rssi: 0
+                    )
                 )
-            )
-            controllers.sort { $0.id < $1.id }
+                updated.sort { $0.id < $1.id }
+                changed = true
+            }
+        }
+
+        for (_, snapshot) in states {
+            var merged = snapshot
+            if let index = updated.firstIndex(where: { $0.id == merged.id }) {
+                if updated[index].status == "ready" { merged.status = "ready" }
+                updated[index] = merged
+            } else {
+                updated.append(merged)
+                updated.sort { $0.id < $1.id }
+            }
+            changed = true
+        }
+
+        if changed {
+            controllers = updated
             stateRevision &+= 1
         }
     }
