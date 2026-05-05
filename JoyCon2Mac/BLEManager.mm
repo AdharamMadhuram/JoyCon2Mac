@@ -680,9 +680,18 @@ waitsForProtocolResponse:(BOOL)waitsForProtocolResponse
 
     [self sendPairingVibrationToContext:context];
     [self setPlayerLED:context.ledMask forContext:context];
-    [self enqueueCommand:[self dataFromHexString:@"0C91010200040000FF000000"] label:@"init sensor data" toContext:context];
-    [self enqueueCommand:[self dataFromHexString:@"0C91010300040000FF000000"] label:@"finalize sensor data" toContext:context];
-    [self enqueueCommand:[self dataFromHexString:@"0C91010400040000FF000000"] label:@"start sensor data" toContext:context];
+    // IMU enable sequence per joycon2cpp's SendCustomCommands: only subCmd 0x02
+    // and 0x04 are sent (not 0x03), using WriteWithoutResponse (no ACK expected).
+    // Passing waitsForProtocolResponse:NO stops the queue from stalling on a
+    // response that never arrives, which is why gyro/accel were stuck at 0.
+    [self enqueueCommand:[self dataFromHexString:@"0C91010200040000FF000000"]
+                   label:@"imu enable step1 (0x02)"
+waitsForProtocolResponse:NO
+               toContext:context];
+    [self enqueueCommand:[self dataFromHexString:@"0C91010400040000FF000000"]
+                   label:@"imu enable step2 (0x04)"
+waitsForProtocolResponse:NO
+               toContext:context];
 }
 
 - (void)scheduleResponseTimeoutForContext:(JoyConPeripheralContext *)context step:(int)step {
@@ -716,7 +725,10 @@ waitsForProtocolResponse:(BOOL)waitsForProtocolResponse
     uint8_t cmdBytes[] = {0x09, 0x91, 0x01, 0x07, 0x00, 0x08, 0x00, 0x00,
                           ledMask, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     NSData *commandData = [NSData dataWithBytes:cmdBytes length:sizeof(cmdBytes)];
-    [self enqueueCommand:commandData label:label ?: @"set player LED" toContext:context];
+    [self enqueueCommand:commandData
+                   label:label ?: @"set player LED"
+waitsForProtocolResponse:NO
+               toContext:context];
 }
 
 - (void)setPlayerLEDFallback:(uint8_t)ledMask forContext:(JoyConPeripheralContext *)context {
@@ -742,6 +754,7 @@ waitsForProtocolResponse:NO
 - (void)sendPairingVibrationToContext:(JoyConPeripheralContext *)context label:(NSString *)label {
     [self enqueueCommand:[self dataFromHexString:@"0A9101020004000003000000"]
                    label:label ?: @"connected vibration"
+waitsForProtocolResponse:NO
                toContext:context];
 }
 
