@@ -70,37 +70,58 @@ struct NFCTag: Identifiable {
     var timestamp: Date
 }
 
-// DaemonBridge owns two kinds of state:
-//  1. Hot state (controllers, NFC tags) – published, but mutated at most
-//     15 Hz per controller so SwiftUI stays responsive.
-//  2. Log/telemetry noise – NOT published here. Lives on TelemetryStore so
-//     the 100+ lines/sec firehose cannot invalidate controller views.
+// Design notes (frozen-UI postmortem)
+//
+// The UI was freezing because the main thread was doing:
+//   1. File I/O (tailing daemon.jsonl every 100 ms)
+//   2. JSON parsing for ~240 state events per second
+//   3. Appending to a Published string (invalidating every view)
+//   4. SwiftUI view updates
+//
+// Throttling step 3 in isolation does NOT help: steps 1-2 still thrash the
+// main run loop. SwiftUI cannot repaint. Apple's Combine / Concurrency docs
+// (https://developer.apple.com/documentation/swiftui/managing-model-data-in-your-app)
+// explicitly recommend running data ingest on a background queue and
+// publishing to main via a throttled pipeline.
+//
+// So the real fix is architectural:
+//   - Log tailing + JSON parsing run on a dedicated serial background queue.
+//   - State events are gated at 15 Hz per side inside that queue (so we only
+//     do expensive work once per 66 ms).
+//   - Only the gated, pre-built ControllerState is hopped onto main.
+//   - Telemetry log lines go to TelemetryStore, which batch-flushes to main
+//     every 200 ms. Settings/Logs views are the only subscribers.
 class DaemonBridge: ObservableObject {
     static let shared = DaemonBridge()
 
     @Published var controllers: [ControllerState] = []
     @Published var nfcTags: [NFCTag] = []
     @Published var isDaemonRunning = false
-    // Kept for source-compat with existing views. These strings are NOT mutated
-    // from the packet firehose anymore; they are updated only on state
-    // transitions (daemon start/stop, driver install result).
-    @Published var daemonOutput: String = ""
-    @Published var telemetryLines: [String] = []
+    // Kept for source-compat with older views. Never mutated from the
+    // packet firehose now; only on driver-install result.
     @Published var driverInstallStatus: String = ""
     @Published var stateRevision: UInt64 = 0
+
+    // Background queue that owns parsing, file tailing, and throttling.
+    // Nothing on this queue touches @Published state directly.
+    private let ingestQueue = DispatchQueue(label: "local.joycon2mac.ingest", qos: .userInitiated)
 
     private var daemonProcess: Process?
     private var daemonApplication: NSRunningApplication?
     private var outputPipe: Pipe?
     private var pendingOutput = ""
-    // Per-controller rate limiter. 15 Hz is plenty for a live UI and a lot
-    // gentler on SwiftUI than the ~120 Hz the daemon actually publishes.
-    private var lastControllerUpdate: [String: Date] = [:]
+    // Per-controller rate limiter (accessed only on ingestQueue).
+    private var lastIngestTime: [String: Date] = [:]
     private let controllerUpdateInterval: TimeInterval = 1.0 / 15.0
     private var shouldRestartAfterTermination = false
-    private var logPollTimer: Timer?
+    private var logPollTimer: DispatchSourceTimer?
     private var daemonLogPath: URL?
     private var daemonLogOffset: UInt64 = 0
+    // Diagnostic counters bumped on ingestQueue; snapshotted for logs.
+    private var ingestPacketCountLeft: UInt64 = 0
+    private var ingestPacketCountRight: UInt64 = 0
+    private var ingestPacketDropLeft: UInt64 = 0
+    private var ingestPacketDropRight: UInt64 = 0
 
     private init() {
         startDaemon()
@@ -109,6 +130,8 @@ class DaemonBridge: ObservableObject {
     deinit {
         stopDaemon()
     }
+
+    // MARK: - Lifecycle
 
     func startDaemon() {
         if let daemonProcess, daemonProcess.isRunning {
@@ -122,7 +145,9 @@ class DaemonBridge: ObservableObject {
         shouldRestartAfterTermination = false
         daemonProcess = nil
         controllers.removeAll()
-        lastControllerUpdate.removeAll()
+        ingestQueue.async { [weak self] in
+            self?.lastIngestTime.removeAll()
+        }
 
         if startBundledDaemonApp() {
             return
@@ -162,9 +187,10 @@ class DaemonBridge: ObservableObject {
             guard let output = String(data: data, encoding: .utf8) else {
                 return
             }
-
-            DispatchQueue.main.async {
-                self?.parseDaemonOutput(output)
+            // NEVER parse on this callback's queue directly; dispatch to
+            // ingest queue so the main thread never sees this work.
+            self?.ingestQueue.async {
+                self?.parseDaemonOutputOnIngestQueue(output)
             }
         }
 
@@ -177,7 +203,6 @@ class DaemonBridge: ObservableObject {
                 self?.outputPipe = nil
                 self?.stopLogPolling()
                 self?.isDaemonRunning = false
-                self?.lastControllerUpdate.removeAll()
                 if shouldRestart {
                     self?.startDaemon()
                 } else {
@@ -220,7 +245,13 @@ class DaemonBridge: ObservableObject {
             daemonLogOffset = 0
             TelemetryStore.shared.setLogPath(logPath)
             controllers.removeAll()
-            lastControllerUpdate.removeAll()
+            ingestQueue.async { [weak self] in
+                self?.lastIngestTime.removeAll()
+                self?.ingestPacketCountLeft = 0
+                self?.ingestPacketCountRight = 0
+                self?.ingestPacketDropLeft = 0
+                self?.ingestPacketDropRight = 0
+            }
 
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = false
@@ -264,7 +295,6 @@ class DaemonBridge: ObservableObject {
             self.daemonApplication = nil
             stopLogPolling()
             markControllersDisconnected(status: "daemonStopped")
-            lastControllerUpdate.removeAll()
             return
         }
 
@@ -272,7 +302,6 @@ class DaemonBridge: ObservableObject {
             outputPipe = nil
             stopLogPolling()
             markControllersDisconnected(status: "daemonStopped")
-            lastControllerUpdate.removeAll()
             return
         }
 
@@ -304,23 +333,28 @@ class DaemonBridge: ObservableObject {
         }
     }
 
+    // MARK: - Log tailing (background)
+
     private func startLogPolling() {
-        logPollTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
-            self?.pollDaemonLog()
+        stopLogPolling()
+        let timer = DispatchSource.makeTimerSource(queue: ingestQueue)
+        timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+        timer.setEventHandler { [weak self] in
+            self?.pollDaemonLogOnIngestQueue()
         }
         logPollTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        timer.resume()
     }
 
     private func stopLogPolling() {
-        logPollTimer?.invalidate()
+        logPollTimer?.cancel()
         logPollTimer = nil
     }
 
-    private func pollDaemonLog() {
+    private func pollDaemonLogOnIngestQueue() {
+        // Runs on ingestQueue.
         if let daemonApplication, daemonApplication.isTerminated {
-            handleDaemonTerminated()
+            DispatchQueue.main.async { [weak self] in self?.handleDaemonTerminated() }
             return
         }
 
@@ -342,12 +376,214 @@ class DaemonBridge: ObservableObject {
             daemonLogOffset = try handle.offset()
             try handle.close()
             if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                parseDaemonOutput(output)
+                parseDaemonOutputOnIngestQueue(output)
             }
         } catch {
             try? handle.close()
         }
     }
+
+    // MARK: - Parsing (background)
+
+    private func parseDaemonOutputOnIngestQueue(_ output: String) {
+        // Runs on ingestQueue.
+        pendingOutput += output
+
+        while let newlineRange = pendingOutput.range(of: "\n") {
+            let line = String(pendingOutput[..<newlineRange.lowerBound])
+            pendingOutput.removeSubrange(...newlineRange.lowerBound)
+            parseDaemonLineOnIngestQueue(line.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    private func parseDaemonLineOnIngestQueue(_ line: String) {
+        guard line.hasPrefix("{"), let data = line.data(using: .utf8) else {
+            TelemetryStore.shared.append(line)
+            return
+        }
+
+        // Fast path: peek at "event" without full JSON parse so we can drop
+        // state packets that are inside the 15 Hz throttle window.
+        let maybeState = line.contains("\"event\":\"state\"")
+        if maybeState {
+            let side = extractStateSide(in: line) ?? "left"
+            let now = Date()
+            if let last = lastIngestTime[side], now.timeIntervalSince(last) < controllerUpdateInterval {
+                if side == "right" { ingestPacketDropRight &+= 1 } else { ingestPacketDropLeft &+= 1 }
+                return
+            }
+            lastIngestTime[side] = now
+            if side == "right" { ingestPacketCountRight &+= 1 } else { ingestPacketCountLeft &+= 1 }
+        }
+
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let event = object["event"] as? String else {
+            TelemetryStore.shared.append(line)
+            return
+        }
+
+        switch event {
+        case "daemon":
+            let status = stringValue(object["status"], default: "unknown")
+            let detail = stringValue(object["detail"], default: "")
+            TelemetryStore.shared.append("[daemon] \(status)\(detail.isEmpty ? "" : " - \(detail)")")
+            DispatchQueue.main.async { [weak self] in
+                if status == "started" { self?.isDaemonRunning = true }
+                else if status == "exiting" { self?.isDaemonRunning = false }
+            }
+        case "telemetry":
+            let side = stringValue(object["side"], default: "left")
+            let phase = stringValue(object["phase"], default: "unknown")
+            let detail = stringValue(object["detail"], default: "")
+            let name = stringValue(object["name"], default: "")
+            TelemetryStore.shared.append("[\(side)] \(phase)\(name.isEmpty ? "" : " \(name)")\(detail.isEmpty ? "" : " - \(detail)")")
+        case "controller":
+            let snapshot = buildControllerStatus(from: object)
+            DispatchQueue.main.async { [weak self] in self?.applyControllerStatus(snapshot) }
+        case "state":
+            let snapshot = buildControllerState(from: object)
+            DispatchQueue.main.async { [weak self] in self?.applyControllerState(snapshot) }
+        case "nfc":
+            guard let uid = object["uid"] as? String else { return }
+            let payloadHex = object["payload"] as? String ?? ""
+            let tag = NFCTag(
+                uid: uid,
+                type: object["type"] as? String ?? "Vendor",
+                data: Data(payloadHex.utf8),
+                timestamp: Date()
+            )
+            DispatchQueue.main.async { [weak self] in self?.nfcTags.insert(tag, at: 0) }
+        default:
+            return
+        }
+    }
+
+    // Cheap extraction of "side" from a state JSON line without full decode.
+    private func extractStateSide(in line: String) -> String? {
+        if line.contains("\"side\":\"right\"") { return "right" }
+        if line.contains("\"side\":\"left\"") { return "left" }
+        return nil
+    }
+
+    // MARK: - Snapshot builders (background)
+
+    private func buildControllerState(from object: [String: Any]) -> ControllerState {
+        let side = stringValue(object["side"], default: "left")
+        let normalizedSide = side == "right" ? "right" : "left"
+        return ControllerState(
+            id: normalizedSide,
+            side: normalizedSide,
+            name: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L",
+            macAddress: normalizedSide == "right" ? "Right BLE peripheral" : "Left BLE peripheral",
+            isConnected: true,
+            status: "streaming",
+            batteryVoltage: doubleValue(object["batteryVoltage"]),
+            batteryCurrent: doubleValue(object["batteryCurrent"]),
+            batteryTemperature: doubleValue(object["batteryTemperature"]),
+            batteryPercentage: doubleValue(object["batteryPercentage"], default: -1),
+            buttons: uint32Value(object["buttons"]),
+            leftButtons: uint32Value(object["leftButtons"]),
+            rightButtons: uint32Value(object["rightButtons"]),
+            leftStickX: int16Value(object["leftStickX"]),
+            leftStickY: int16Value(object["leftStickY"]),
+            rightStickX: int16Value(object["rightStickX"]),
+            rightStickY: int16Value(object["rightStickY"]),
+            gyroX: doubleValue(object["gyroX"]),
+            gyroY: doubleValue(object["gyroY"]),
+            gyroZ: doubleValue(object["gyroZ"]),
+            accelX: doubleValue(object["accelX"]),
+            accelY: doubleValue(object["accelY"]),
+            accelZ: doubleValue(object["accelZ"]),
+            mouseX: int16Value(object["mouseX"]),
+            mouseY: int16Value(object["mouseY"]),
+            mouseDistance: int16Value(object["mouseDistance"]),
+            triggerL: uint8Value(object["triggerL"]),
+            triggerR: uint8Value(object["triggerR"]),
+            packetCount: uint32Value(object["packetCount"]),
+            mouseMode: MouseMode(rawValue: intValue(object["mouseMode"])) ?? .off,
+            rssi: intValue(object["rssi"], default: 0)
+        )
+    }
+
+    private struct ControllerStatusSnapshot {
+        let side: String
+        let status: String
+        let message: String
+        let name: String
+        let isConnected: Bool
+    }
+
+    private func buildControllerStatus(from object: [String: Any]) -> ControllerStatusSnapshot {
+        let side = stringValue(object["side"], default: "left")
+        let normalizedSide = side == "right" ? "right" : "left"
+        let rawStatus = stringValue(object["status"], default: "scanning")
+        let name = stringValue(
+            object["name"],
+            default: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L"
+        )
+        let message = stringValue(object["message"], default: "")
+        let connectedStatuses = ["bleConnected", "servicesReady", "initializing", "ready", "streaming", "commandTimeout"]
+        return ControllerStatusSnapshot(
+            side: normalizedSide,
+            status: rawStatus,
+            message: message,
+            name: name,
+            isConnected: connectedStatuses.contains(rawStatus)
+        )
+    }
+
+    // MARK: - Main-thread appliers
+
+    private func applyControllerState(_ snapshot: ControllerState) {
+        var merged = snapshot
+        if let index = controllers.firstIndex(where: { $0.id == merged.id }) {
+            // Preserve upgraded status like "ready" so it doesn't regress.
+            let existing = controllers[index]
+            if existing.status == "ready" { merged.status = "ready" }
+            controllers[index] = merged
+        } else {
+            controllers.append(merged)
+            controllers.sort { $0.id < $1.id }
+        }
+        stateRevision &+= 1
+    }
+
+    private func applyControllerStatus(_ snapshot: ControllerStatusSnapshot) {
+        if let index = controllers.firstIndex(where: { $0.id == snapshot.side }) {
+            controllers[index].isConnected = snapshot.isConnected
+            if shouldReplaceStatus(current: controllers[index].status, incoming: snapshot.status) {
+                controllers[index].status = snapshot.status
+            }
+            if !snapshot.name.isEmpty {
+                controllers[index].name = snapshot.side == "right" ? "Joy-Con R" : "Joy-Con L"
+                controllers[index].macAddress = snapshot.message.isEmpty ? snapshot.name : snapshot.message
+            }
+            stateRevision &+= 1
+        } else {
+            controllers.append(
+                ControllerState(
+                    id: snapshot.side,
+                    side: snapshot.side,
+                    name: snapshot.side == "right" ? "Joy-Con R" : "Joy-Con L",
+                    macAddress: snapshot.message.isEmpty ? snapshot.name : snapshot.message,
+                    isConnected: snapshot.isConnected,
+                    status: snapshot.status,
+                    batteryVoltage: 0, batteryCurrent: 0, batteryTemperature: 0, batteryPercentage: -1,
+                    buttons: 0, leftButtons: 0, rightButtons: 0,
+                    leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0,
+                    gyroX: 0, gyroY: 0, gyroZ: 0,
+                    accelX: 0, accelY: 0, accelZ: 0,
+                    mouseX: 0, mouseY: 0, mouseDistance: 0,
+                    triggerL: 0, triggerR: 0,
+                    packetCount: 0, mouseMode: .off, rssi: 0
+                )
+            )
+            controllers.sort { $0.id < $1.id }
+            stateRevision &+= 1
+        }
+    }
+
+    // MARK: - Misc
 
     func toggleMouseMode() {
         if let controller = controllers.first {
@@ -356,7 +592,7 @@ class DaemonBridge: ObservableObject {
             var updated = controllers
             updated[0].mouseMode = newMode
             controllers = updated
-            bumpStateRevision()
+            stateRevision &+= 1
         }
     }
 
@@ -378,9 +614,13 @@ class DaemonBridge: ObservableObject {
 
     func clearTelemetryView() {
         TelemetryStore.shared.clear()
-        // Kept-for-compat fields — also flush to keep any legacy bindings happy.
-        daemonOutput = ""
-        telemetryLines.removeAll()
+    }
+
+    // Expose counters for diagnostic overlay.
+    func ingestDiagnostics() -> (leftKept: UInt64, rightKept: UInt64, leftDropped: UInt64, rightDropped: UInt64) {
+        ingestQueue.sync {
+            (ingestPacketCountLeft, ingestPacketCountRight, ingestPacketDropLeft, ingestPacketDropRight)
+        }
     }
 
     func installAndLoadDriver() {
@@ -415,44 +655,6 @@ class DaemonBridge: ObservableObject {
         }
     }
 
-    private func parseDaemonOutput(_ output: String) {
-        pendingOutput += output
-
-        while let newlineRange = pendingOutput.range(of: "\n") {
-            let line = String(pendingOutput[..<newlineRange.lowerBound])
-            pendingOutput.removeSubrange(...newlineRange.lowerBound)
-            parseDaemonLine(line.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-    }
-
-    private func parseDaemonLine(_ line: String) {
-        guard line.hasPrefix("{"), let data = line.data(using: .utf8) else {
-            TelemetryStore.shared.append(line)
-            return
-        }
-
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let event = object["event"] as? String else {
-            TelemetryStore.shared.append(line)
-            return
-        }
-
-        switch event {
-        case "daemon":
-            updateDaemonStatus(from: object)
-        case "telemetry":
-            appendTelemetry(from: object)
-        case "controller":
-            updateControllerStatus(from: object)
-        case "state":
-            updateController(from: object)
-        case "nfc":
-            appendNFCTag(from: object)
-        default:
-            return
-        }
-    }
-
     private func markControllersDisconnected(status: String) {
         var updated = controllers
         for index in updated.indices {
@@ -460,7 +662,7 @@ class DaemonBridge: ObservableObject {
             updated[index].status = status
         }
         controllers = updated
-        bumpStateRevision()
+        stateRevision &+= 1
     }
 
     private func handleDaemonTerminated() {
@@ -469,7 +671,6 @@ class DaemonBridge: ObservableObject {
         outputPipe = nil
         stopLogPolling()
         isDaemonRunning = false
-        lastControllerUpdate.removeAll()
         TelemetryStore.shared.append("[daemon] helper process terminated")
         if shouldRestartAfterTermination {
             shouldRestartAfterTermination = false
@@ -477,27 +678,6 @@ class DaemonBridge: ObservableObject {
         } else {
             markControllersDisconnected(status: "daemonStopped")
         }
-    }
-
-    private func updateDaemonStatus(from object: [String: Any]) {
-        let status = stringValue(object["status"], default: "unknown")
-        let detail = stringValue(object["detail"], default: "")
-        TelemetryStore.shared.append("[daemon] \(status)\(detail.isEmpty ? "" : " - \(detail)")")
-        if status == "started" {
-            isDaemonRunning = true
-        } else if status == "exiting" {
-            isDaemonRunning = false
-        }
-    }
-
-    private func appendTelemetry(from object: [String: Any]) {
-        let side = stringValue(object["side"], default: "left")
-        let phase = stringValue(object["phase"], default: "unknown")
-        let detail = stringValue(object["detail"], default: "")
-        let name = stringValue(object["name"], default: "")
-        let line = "[\(side)] \(phase)\(name.isEmpty ? "" : " \(name)")\(detail.isEmpty ? "" : " - \(detail)")"
-        // Firehose goes only to TelemetryStore now. No publisher invalidation on DaemonBridge.
-        TelemetryStore.shared.append(line)
     }
 
     private func statusRank(_ status: String) -> Int {
@@ -525,146 +705,6 @@ class DaemonBridge: ObservableObject {
             return true
         }
         return statusRank(incoming) >= statusRank(current)
-    }
-
-    private func updateController(from object: [String: Any]) {
-        let side = stringValue(object["side"], default: "left")
-        let normalizedSide = side == "right" ? "right" : "left"
-        let now = Date()
-        if let lastUpdate = lastControllerUpdate[normalizedSide],
-           now.timeIntervalSince(lastUpdate) < controllerUpdateInterval {
-            return
-        }
-        lastControllerUpdate[normalizedSide] = now
-        let currentStatus = controllers.first(where: { $0.id == normalizedSide })?.status
-        let dataStatus = currentStatus == "ready" ? "ready" : (currentStatus ?? "streaming")
-
-        let controller = ControllerState(
-            id: normalizedSide,
-            side: normalizedSide,
-            name: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L",
-            macAddress: normalizedSide == "right" ? "Right BLE peripheral" : "Left BLE peripheral",
-            isConnected: true,
-            status: dataStatus,
-            batteryVoltage: doubleValue(object["batteryVoltage"]),
-            batteryCurrent: doubleValue(object["batteryCurrent"]),
-            batteryTemperature: doubleValue(object["batteryTemperature"]),
-            batteryPercentage: doubleValue(object["batteryPercentage"], default: -1),
-            buttons: uint32Value(object["buttons"]),
-            leftButtons: uint32Value(object["leftButtons"]),
-            rightButtons: uint32Value(object["rightButtons"]),
-            leftStickX: int16Value(object["leftStickX"]),
-            leftStickY: int16Value(object["leftStickY"]),
-            rightStickX: int16Value(object["rightStickX"]),
-            rightStickY: int16Value(object["rightStickY"]),
-            gyroX: doubleValue(object["gyroX"]),
-            gyroY: doubleValue(object["gyroY"]),
-            gyroZ: doubleValue(object["gyroZ"]),
-            accelX: doubleValue(object["accelX"]),
-            accelY: doubleValue(object["accelY"]),
-            accelZ: doubleValue(object["accelZ"]),
-            mouseX: int16Value(object["mouseX"]),
-            mouseY: int16Value(object["mouseY"]),
-            mouseDistance: int16Value(object["mouseDistance"]),
-            triggerL: uint8Value(object["triggerL"]),
-            triggerR: uint8Value(object["triggerR"]),
-            packetCount: uint32Value(object["packetCount"]),
-            mouseMode: MouseMode(rawValue: intValue(object["mouseMode"])) ?? .off,
-            rssi: intValue(object["rssi"], default: 0)
-        )
-
-        var updated = controllers
-        if let index = updated.firstIndex(where: { $0.id == controller.id }) {
-            updated[index] = controller
-        } else {
-            updated.append(controller)
-            updated.sort { $0.id < $1.id }
-        }
-        controllers = updated
-        bumpStateRevision()
-    }
-
-    private func updateControllerStatus(from object: [String: Any]) {
-        let side = stringValue(object["side"], default: "left")
-        let normalizedSide = side == "right" ? "right" : "left"
-        let rawStatus = stringValue(object["status"], default: "scanning")
-        let name = stringValue(
-            object["name"],
-            default: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L"
-        )
-        let message = stringValue(object["message"], default: "")
-        let connectedStatuses = ["bleConnected", "servicesReady", "initializing", "ready", "streaming", "commandTimeout"]
-        let isConnected = connectedStatuses.contains(rawStatus)
-
-        var updated = controllers
-        if let index = updated.firstIndex(where: { $0.id == normalizedSide }) {
-            updated[index].isConnected = isConnected
-            if shouldReplaceStatus(current: updated[index].status, incoming: rawStatus) {
-                updated[index].status = rawStatus
-            }
-            if !name.isEmpty {
-                updated[index].name = normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L"
-                updated[index].macAddress = message.isEmpty ? name : message
-            }
-            controllers = updated
-            bumpStateRevision()
-        } else {
-            updated.append(
-                ControllerState(
-                    id: normalizedSide,
-                    side: normalizedSide,
-                    name: normalizedSide == "right" ? "Joy-Con R" : "Joy-Con L",
-                    macAddress: message.isEmpty ? name : message,
-                    isConnected: isConnected,
-                    status: rawStatus,
-                    batteryVoltage: 0,
-                    batteryCurrent: 0,
-                    batteryTemperature: 0,
-                    batteryPercentage: -1,
-                    buttons: 0,
-                    leftButtons: 0,
-                    rightButtons: 0,
-                    leftStickX: 0,
-                    leftStickY: 0,
-                    rightStickX: 0,
-                    rightStickY: 0,
-                    gyroX: 0,
-                    gyroY: 0,
-                    gyroZ: 0,
-                    accelX: 0,
-                    accelY: 0,
-                    accelZ: 0,
-                    mouseX: 0,
-                    mouseY: 0,
-                    mouseDistance: 0,
-                    triggerL: 0,
-                    triggerR: 0,
-                    packetCount: 0,
-                    mouseMode: .off,
-                    rssi: 0
-                )
-            )
-            updated.sort { $0.id < $1.id }
-            controllers = updated
-            bumpStateRevision()
-        }
-    }
-
-    private func appendNFCTag(from object: [String: Any]) {
-        guard let uid = object["uid"] as? String else {
-            return
-        }
-
-        let payloadHex = object["payload"] as? String ?? ""
-        nfcTags.insert(
-            NFCTag(
-                uid: uid,
-                type: object["type"] as? String ?? "Vendor",
-                data: Data(payloadHex.utf8),
-                timestamp: Date()
-            ),
-            at: 0
-        )
     }
 
     private func stringValue(_ value: Any?, default defaultValue: String) -> String {
@@ -695,9 +735,5 @@ class DaemonBridge: ObservableObject {
         if let value = value as? NSNumber { return value.doubleValue }
         if let value = value as? String { return Double(value) ?? defaultValue }
         return defaultValue
-    }
-
-    private func bumpStateRevision() {
-        stateRevision &+= 1
     }
 }

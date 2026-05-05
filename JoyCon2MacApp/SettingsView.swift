@@ -311,7 +311,8 @@ struct SettingsActionRow: View {
 
 struct LogsView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
-    
+    @ObservedObject private var telemetry = TelemetryStore.shared
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -341,14 +342,14 @@ struct LogsView: View {
             ScrollView {
                 ScrollViewReader { proxy in
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(daemonBridge.daemonOutput)
+                        Text(telemetry.displayedOutput)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                             .padding()
                             .id("bottom")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .onChange(of: daemonBridge.daemonOutput) { _ in
+                    .onChange(of: telemetry.telemetryLineCount) { _ in
                         proxy.scrollTo("bottom", anchor: .bottom)
                     }
                 }

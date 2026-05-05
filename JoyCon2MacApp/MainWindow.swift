@@ -117,6 +117,11 @@ struct MainWindow: View {
 
             Spacer()
 
+            // Heartbeat: proves the main thread is ticking. If this stops
+            // pulsing, the UI is actually frozen. If it keeps pulsing but
+            // data views look stuck, that's a binding problem, not a freeze.
+            UIHeartbeat()
+
             Button {
                 daemonBridge.isDaemonRunning ? daemonBridge.stopDaemon() : daemonBridge.startDaemon()
             } label: {
@@ -177,4 +182,31 @@ struct MainWindow: View {
 #Preview {
     MainWindow()
         .environmentObject(DaemonBridge.shared)
+}
+
+// Live diagnostic indicator. TimelineView is driven by the SwiftUI scheduler
+// itself, so when the main thread stalls, the dot freezes with it.
+// When we see "UI ticking" here alongside rising Gamepad packet counts but
+// stale controller views, we know the problem is a binding issue, not a
+// main-thread stall.
+struct UIHeartbeat: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            let phase = Int(context.date.timeIntervalSinceReferenceDate * 4) % 2
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(phase == 0 ? Color.green : Color.green.opacity(0.35))
+                    .frame(width: 8, height: 8)
+                Text("UI ticking")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(NSColor.controlBackgroundColor))
+            )
+        }
+    }
 }
