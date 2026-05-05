@@ -534,7 +534,10 @@ waitsForProtocolResponse:(BOOL)waitsForProtocolResponse
                 context.pairingPersistenceStarted = YES;
                 [self sendPairingPersistenceCommandsToContext:context];
             }
-            [self sendPairingVibrationToContext:context label:@"connected vibration confirm"];
+            // Emit exactly one confirmation: flip the LED to final pattern.
+            // Removing the duplicate "connected vibration confirm" pulse —
+            // Joy2Win already got a vibration inside initializeIMUForContext,
+            // so doing a second one here makes the controllers buzz twice.
             [self setPlayerLED:context.ledMask forContext:context label:@"set player LED final"];
             if (context.commandQueue.count == 0 && !context.commandInFlight) {
                 [self sendNextQueuedCommandForContext:context];

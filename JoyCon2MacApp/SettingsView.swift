@@ -2,26 +2,25 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
+    @ObservedObject private var telemetry = TelemetryStore.shared
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("autoReconnect") private var autoReconnect = true
     @AppStorage("showNotifications") private var showNotifications = true
     @AppStorage("logLevel") private var logLevel = "Info"
     @AppStorage("deadzone") private var deadzone: Double = 0.08
     @AppStorage("stickSensitivity") private var stickSensitivity: Double = 1.0
-    
+
     var body: some View {
         Form {
             Section("General") {
                 Toggle("Launch at Login", isOn: $launchAtLogin)
                     .help("Automatically start JoyCon2Mac when you log in")
-                
                 Toggle("Auto-Reconnect", isOn: $autoReconnect)
                     .help("Automatically reconnect to paired controllers")
-                
                 Toggle("Show Notifications", isOn: $showNotifications)
                     .help("Show notifications when controllers connect/disconnect")
             }
-            
+
             Section("Daemon") {
                 HStack {
                     Text("Status:")
@@ -32,19 +31,18 @@ struct SettingsView: View {
                     Text(daemonBridge.isDaemonRunning ? "Running" : "Stopped")
                         .foregroundColor(.secondary)
                 }
-                
+
                 Picker("Log Level", selection: $logLevel) {
                     Text("Error").tag("Error")
                     Text("Warning").tag("Warning")
                     Text("Info").tag("Info")
                     Text("Debug").tag("Debug")
                 }
-                
+
                 HStack {
                     Button("Restart Daemon") {
                         daemonBridge.restartDaemon()
                     }
-                    
                     Button("View Logs") {
                         showLogs()
                     }
@@ -61,8 +59,8 @@ struct SettingsView: View {
                     action: daemonBridge.installAndLoadDriver
                 )
 
-                if !daemonBridge.driverInstallStatus.isEmpty {
-                    Text(daemonBridge.driverInstallStatus)
+                if !telemetry.driverInstallStatus.isEmpty {
+                    Text(telemetry.driverInstallStatus)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
@@ -74,7 +72,7 @@ struct SettingsView: View {
                     Text("Log File")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text(daemonBridge.telemetryLogPath)
+                    Text(telemetry.telemetryLogPath)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                         .lineLimit(2)
@@ -82,19 +80,17 @@ struct SettingsView: View {
 
                 HStack {
                     Button("Reveal Log File") {
-                        daemonBridge.revealTelemetryLog()
+                        telemetry.revealLog()
                     }
-
                     Button("Copy Visible Logs") {
-                        daemonBridge.copyTelemetryToClipboard()
+                        telemetry.copyToClipboard()
                     }
-
                     Button("Clear View") {
-                        daemonBridge.clearTelemetryView()
+                        telemetry.clear()
                     }
                 }
             }
-            
+
             Section("Controller") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Deadzone: \(deadzone, specifier: "%.2f")")
@@ -103,7 +99,7 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Stick Sensitivity: \(stickSensitivity, specifier: "%.2f")x")
                     Slider(value: $stickSensitivity, in: 0.5...2.0, step: 0.1)
@@ -111,12 +107,12 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                
+
                 Button("Calibrate Sticks") {
                     // Open calibration wizard
                 }
             }
-            
+
             Section("Data") {
                 SettingsActionRow(
                     icon: "square.and.arrow.up",
@@ -156,7 +152,7 @@ struct SettingsView: View {
                     action: resetToDefaults
                 )
             }
-            
+
             Section("About") {
                 HStack {
                     Text("Version:")
@@ -164,23 +160,22 @@ struct SettingsView: View {
                     Text("1.0.0")
                         .foregroundColor(.secondary)
                 }
-                
+
                 HStack {
                     Text("Build:")
                     Spacer()
                     Text("2026.05.05")
                         .foregroundColor(.secondary)
                 }
-                
+
                 Link("GitHub Repository", destination: URL(string: "https://github.com/yourusername/joycon2mac")!)
-                
                 Link("Report Issue", destination: URL(string: "https://github.com/yourusername/joycon2mac/issues")!)
             }
         }
         .formStyle(.grouped)
         .frame(minWidth: 500, minHeight: 600)
     }
-    
+
     func showLogs() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
@@ -189,19 +184,17 @@ struct SettingsView: View {
             defer: false
         )
         window.title = "Daemon Logs"
-        window.contentView = NSHostingView(rootView: LogsView().environmentObject(daemonBridge))
+        window.contentView = NSHostingView(rootView: LogsView())
         window.center()
         window.makeKeyAndOrderFront(nil)
     }
-    
+
     func exportConfig() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "joycon2mac_config.json"
         panel.allowedContentTypes = [.json]
-        
         panel.begin { response in
             if response == .OK, let url = panel.url {
-                // Export configuration
                 let config: [String: Any] = [
                     "launchAtLogin": launchAtLogin,
                     "autoReconnect": autoReconnect,
@@ -210,21 +203,18 @@ struct SettingsView: View {
                     "deadzone": deadzone,
                     "stickSensitivity": stickSensitivity
                 ]
-                
                 if let data = try? JSONSerialization.data(withJSONObject: config, options: .prettyPrinted) {
                     try? data.write(to: url)
                 }
             }
         }
     }
-    
+
     func importConfig() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.json]
-        
         panel.begin { response in
             if response == .OK, let url = panel.url {
-                // Import configuration
                 if let data = try? Data(contentsOf: url),
                    let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     launchAtLogin = config["launchAtLogin"] as? Bool ?? false
@@ -237,7 +227,7 @@ struct SettingsView: View {
             }
         }
     }
-    
+
     func clearPairedControllers() {
         let alert = NSAlert()
         alert.messageText = "Clear Paired Controllers?"
@@ -245,13 +235,11 @@ struct SettingsView: View {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Clear")
         alert.addButton(withTitle: "Cancel")
-        
         if alert.runModal() == .alertFirstButtonReturn {
-            // Clear paired controllers from UserDefaults
             UserDefaults.standard.removeObject(forKey: "PairedControllers")
         }
     }
-    
+
     func resetToDefaults() {
         let alert = NSAlert()
         alert.messageText = "Reset to Defaults?"
@@ -259,7 +247,6 @@ struct SettingsView: View {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
-        
         if alert.runModal() == .alertFirstButtonReturn {
             launchAtLogin = false
             autoReconnect = true
@@ -310,28 +297,28 @@ struct SettingsActionRow: View {
 }
 
 struct LogsView: View {
-    @EnvironmentObject var daemonBridge: DaemonBridge
-    
+    @ObservedObject private var telemetry = TelemetryStore.shared
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("JoyCon2Mac Telemetry")
                         .font(.headline)
-                    Text(daemonBridge.telemetryLogPath)
+                    Text(telemetry.telemetryLogPath)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
                 }
                 Spacer()
                 Button("Reveal") {
-                    daemonBridge.revealTelemetryLog()
+                    telemetry.revealLog()
                 }
                 Button("Copy") {
-                    daemonBridge.copyTelemetryToClipboard()
+                    telemetry.copyToClipboard()
                 }
                 Button("Clear") {
-                    daemonBridge.clearTelemetryView()
+                    telemetry.clear()
                 }
             }
             .padding(12)
@@ -341,14 +328,14 @@ struct LogsView: View {
             ScrollView {
                 ScrollViewReader { proxy in
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(daemonBridge.daemonOutput)
+                        Text(telemetry.displayedOutput)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                             .padding()
                             .id("bottom")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .onChange(of: daemonBridge.daemonOutput) { _ in
+                    .onChange(of: telemetry.telemetryLineCount) { _ in
                         proxy.scrollTo("bottom", anchor: .bottom)
                     }
                 }
