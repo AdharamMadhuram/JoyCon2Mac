@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>JoyCon2Mac</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.joycon2mac.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>JoyCon2Mac</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>2026.05.05</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>JoyCon2Mac connects to Nintendo Switch 2 Joy-Con controllers over Bluetooth.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Local development build.</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>JoyCon2Mac installs a local DriverKit HID extension so Joy-Con 2 controllers appear as a system gamepad and mouse.</string>
+    <key>OSBundleUsageDescription</key>
+    <string>JoyCon2Mac installs a local DriverKit HID extension so Joy-Con 2 controllers appear as a system gamepad and mouse.</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

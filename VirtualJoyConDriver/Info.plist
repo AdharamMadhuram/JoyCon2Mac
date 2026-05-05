@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>VirtualJoyConDriver</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.joycon2mac.VirtualJoyConDriver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>VirtualJoyConDriver</string>
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>VirtualJoyConDriver</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.joycon2mac.VirtualJoyConDriver</string>
+			<key>IOClass</key>
+			<string>IOUserHIDDevice</string>
+			<key>IOProviderClass</key>
+			<string>IOUserHIDDevice</string>
+			<key>IOUserClass</key>
+			<string>VirtualJoyConDriver</string>
+			<key>Transport</key>
+			<string>Virtual</string>
+			<key>VendorID</key>
+			<integer>1406</integer>
+			<key>ProductID</key>
+			<integer>8201</integer>
+		</dict>
+	</dict>
+	<key>OSBundleUsageDescription</key>
+	<string>Virtual Joy-Con HID Driver for macOS</string>
+</dict>
+</plist>

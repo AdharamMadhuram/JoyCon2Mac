@@ -1,0 +1,72 @@
+#ifndef VirtualJoyConDriver_h
+#define VirtualJoyConDriver_h
+
+#include <Availability.h>
+#include <HIDDriverKit/IOUserHIDDevice.iig>
+#include <DriverKit/IOUserClient.iig>
+
+// Struct for the basic JoyCon Report we will pass from user-space to kernel-space
+struct JoyConReportData {
+    uint32_t buttons;
+    uint8_t dpad;
+    int16_t stickLX;
+    int16_t stickLY;
+    int16_t stickRX;
+    int16_t stickRY;
+    uint8_t triggerL;
+    uint8_t triggerR;
+};
+
+struct JoyConMouseReportData {
+    uint8_t buttons; // Left=1, Right=2, Middle=4
+    int16_t deltaX;
+    int16_t deltaY;
+    int8_t scroll;
+};
+
+struct JoyConNFCReportData {
+    uint8_t status;
+    uint8_t tagId[7];
+    uint8_t payload[32]; // Max read size per chunk
+};
+
+class VirtualJoyConDriver : public IOUserHIDDevice
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
+    virtual kern_return_t NewUserClient(uint32_t type, IOUserClient ** userClient) override;
+
+    virtual OSDictionary * newDeviceDescription() override;
+    virtual OSData * newReportDescriptor() override;
+
+    virtual kern_return_t setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
+    virtual kern_return_t getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
+
+    // Custom methods meant to be called from the daemon user-client
+    kern_return_t dispatchGamepadReport(JoyConReportData reportData) LOCALONLY;
+    kern_return_t dispatchMouseReport(JoyConMouseReportData reportData) LOCALONLY;
+    kern_return_t dispatchNFCReport(JoyConNFCReportData reportData) LOCALONLY;
+};
+
+class VirtualJoyConUserClient : public IOUserClient
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
+
+    virtual kern_return_t ExternalMethod(
+        uint64_t selector,
+        IOUserClientMethodArguments * arguments,
+        const IOUserClientMethodDispatch * dispatch,
+        OSObject * target,
+        void * reference) override;
+};
+
+#endif /* VirtualJoyConDriver_h */
