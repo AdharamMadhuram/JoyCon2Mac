@@ -86,6 +86,16 @@ cat > "$DEXT_CONTENTS/Info.plist" <<'PLIST'
     <string>1.0.0</string>
     <key>CFBundleVersion</key>
     <string>2026.05.05</string>
+    <!--
+      macOS 15+ sysextd rejects any driver_extension Info.plist that does
+      not carry OSBundleUsageDescription — the activation request fails
+      with "extensions belonging to the com.apple.system_extension.
+      driver_extension category require the presence of the
+      'OSBundleUsageDescription' property". The string is shown in the
+      System Settings approval prompt, so keep it human-readable.
+    -->
+    <key>OSBundleUsageDescription</key>
+    <string>JoyCon2Mac Virtual HID Driver — exposes paired Joy-Con 2 controllers as a system gamepad and mouse so games, browsers, and macOS itself can use them as real HID devices.</string>
     <key>IOKitPersonalities</key>
     <dict>
         <key>VirtualJoyConDriver</key>

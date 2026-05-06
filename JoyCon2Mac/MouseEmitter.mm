@@ -27,6 +27,22 @@
 @property (nonatomic, assign) int16_t lastOpticalXRight;
 @property (nonatomic, assign) int16_t lastOpticalYRight;
 
+// Per-side rolling state used by Auto to decide which Joy-Con owns the
+// pointer. `lastDistance*` is the latest surface-distance reading; `airFrames*`
+// counts consecutive packets where the distance dropped to zero.
+//
+// Why: without hysteresis Auto ping-pongs every packet when both Joy-Cons
+// rest on the same surface (both report distance > 0). The old rule —
+// "switch to whatever side just reported distance > 0" — flipped ownership
+// every BLE notification, so the cursor moved roughly 30 ns at a time before
+// the other side took over. Hysteresis fixes it: only consider switching
+// after the currently-active side has been airborne for a few packets, or
+// when the other side's distance is *lower* (i.e. closer to the surface).
+@property (nonatomic, assign) uint16_t lastDistanceLeft;
+@property (nonatomic, assign) uint16_t lastDistanceRight;
+@property (nonatomic, assign) uint8_t airFramesLeft;
+@property (nonatomic, assign) uint8_t airFramesRight;
+
 // Shared click / scroll / side-button state. The mouse pointer is a single
 // macOS object; it doesn't matter which Joy-Con clicked. We don't want
 // clicks to stick down if you switch sides mid-press, so releasing a side
@@ -57,6 +73,10 @@
         _currentMode = MouseModeOff;
         _source = MouseSourceAuto;
         _lastActiveSide = JoyConSide::Right;
+        _lastDistanceLeft = 0;
+        _lastDistanceRight = 0;
+        _airFramesLeft = 0;
+        _airFramesRight = 0;
         _firstOpticalReadLeft = YES;
         _firstOpticalReadRight = YES;
         _lastOpticalXLeft = 0;
@@ -95,6 +115,18 @@
     _firstOpticalReadLeft = YES;
     _firstOpticalReadRight = YES;
     _scrollAccumulator = 0.0f;
+    // Snap the active side to the picker's choice right away so the GUI's
+    // "Active" badge flips the moment the user makes the selection, instead
+    // of waiting for the next BLE packet to arrive from the chosen side.
+    if (source == MouseSourceLeft) {
+        _lastActiveSide = JoyConSide::Left;
+    } else if (source == MouseSourceRight) {
+        _lastActiveSide = JoyConSide::Right;
+    }
+    // Reset the airborne counters on explicit switches so hysteresis does
+    // not immediately flip us back to the side we were on before.
+    _airFramesLeft = 0;
+    _airFramesRight = 0;
     [self releaseAllMouseButtons];
 }
 
@@ -107,24 +139,61 @@
         return NO;
     }
 
-    // Pick the side that "owns" this packet. Auto uses the classical rule:
-    // a Joy-Con on a surface reports a non-zero distance at byte 0x17, one
-    // being held in the air reports 0. If both are non-zero, keep whichever
-    // we were using last (avoid ping-ponging). If both are zero and we have
-    // no history, default to Right — joycon2cpp's original pick.
+    // Record this packet's distance into the per-side rolling state so the
+    // Auto picker below (and successive packets) has both sides' recent
+    // surface status available, even though each call only sees one side.
+    if (side == JoyConSide::Left) {
+        _lastDistanceLeft = mouseDistance;
+        if (mouseDistance == 0) {
+            if (_airFramesLeft < 255) _airFramesLeft += 1;
+        } else {
+            _airFramesLeft = 0;
+        }
+    } else {
+        _lastDistanceRight = mouseDistance;
+        if (mouseDistance == 0) {
+            if (_airFramesRight < 255) _airFramesRight += 1;
+        } else {
+            _airFramesRight = 0;
+        }
+    }
+
+    // Pick the side that "owns" this packet.
+    //
+    // Auto policy (with hysteresis to kill the per-packet ping-pong we saw
+    // when both Joy-Cons sat on the same surface):
+    //   1. If the currently-active side is still on a surface (distance > 0),
+    //      keep it. We only consider switching if it has been airborne for
+    //      several consecutive packets.
+    //   2. If the active side has been airborne for >= AIR_HYST packets AND
+    //      the other side is currently on a surface, switch.
+    //   3. If neither side is on a surface, keep the active side. We do NOT
+    //      process the packet (falls through to the gamepad path); mouse
+    //      movement simply stops until one of the Joy-Cons is set down.
+    //
+    // 8 packets ≈ 120 ms at the ~66 Hz BLE push rate — fast enough that the
+    // handover feels instant, slow enough that a momentary lift (e.g. a
+    // click reaction force making the sensor read 0) doesn't drop the side.
+    static const uint8_t AIR_HYST = 8;
+
     JoyConSide activeSide = _lastActiveSide;
     switch (_source) {
         case MouseSourceLeft:  activeSide = JoyConSide::Left;  break;
         case MouseSourceRight: activeSide = JoyConSide::Right; break;
         case MouseSourceAuto:
         default: {
-            if (mouseDistance != 0) {
-                // This side is on a surface. Adopt it if the other side
-                // isn't already owning the pointer while also on a surface.
-                if (side != _lastActiveSide) {
-                    activeSide = side;
-                }
+            bool activeIsLeft = (_lastActiveSide == JoyConSide::Left);
+            uint8_t activeAir = activeIsLeft ? _airFramesLeft  : _airFramesRight;
+            uint16_t otherDistance = activeIsLeft ? _lastDistanceRight : _lastDistanceLeft;
+            uint8_t otherAir = activeIsLeft ? _airFramesRight : _airFramesLeft;
+
+            if (activeAir >= AIR_HYST && otherDistance > 0 && otherAir == 0) {
+                // Active side has clearly been lifted and the other one is
+                // currently on a surface. Hand over.
+                activeSide = activeIsLeft ? JoyConSide::Right : JoyConSide::Left;
             }
+            // Otherwise keep `activeSide == _lastActiveSide`. Both-on-surface
+            // intentionally does NOT trigger a flip.
             break;
         }
     }
