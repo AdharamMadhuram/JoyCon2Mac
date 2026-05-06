@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <sstream>
 #include <climits>
+#include <cstdarg>
 #include <cstdio>
 #include <signal.h>
 
@@ -45,7 +46,10 @@ static ControllerState g_state;
 static bool g_showDetailedOutput = false;
 static bool g_emitJSON = false;
 static bool g_enableGamepad = true;
-static bool g_debugInput = false;   // --debug-input: targeted dpad + right-stick trace
+static bool g_debugInput = true;    // targeted dpad + right-stick trace, on by default
+                                    // (change-triggered — zero output when idle).
+                                    // Disable with --no-debug-input.
+static FILE *g_debugInputFile = nullptr;    // mirrors trace lines to a file you can tail
 static FILE *g_jsonFile = nullptr;
 static NSDate *g_lastPrintTime = nil;
 static NSDate *g_lastJSONLeftTime = nil;
@@ -62,6 +66,26 @@ static BLEManager *g_bleManager = nil;
 static NSString *g_controlFilePath = nil;
 static unsigned long long g_controlFileOffset = 0;
 static dispatch_source_t g_controlFileTimer = nullptr;
+
+// Write one formatted debug-input line to stderr AND (if opened) to the
+// mirror file so you can just `tail -f` the file without wrangling the
+// unified log. Kept __attribute__((format(...))) so the compiler warns
+// on format/argument mismatches.
+__attribute__((format(printf, 1, 2)))
+static void debugInputLog(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[256];
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    fputs(buf, stderr);
+    if (g_debugInputFile) {
+        fputs(buf, g_debugInputFile);
+        // File is already line-buffered; no need to fflush per line.
+    }
+}
+
 
 static void emitJSONLine(const std::string& line) {
     std::cout << line << std::endl;
@@ -461,7 +485,7 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
             uint32_t dpadBits = sideButtons & 0x00000F; // bits 0..3 = D/U/R/L
             if (dpadBits != lastDpadBits || g_state.leftStick.x != lastLX || g_state.leftStick.y != lastLY) {
                 bool u = dpadBits & 0x2, d = dpadBits & 0x1, l = dpadBits & 0x8, r = dpadBits & 0x4;
-                fprintf(stderr,
+                debugInputLog(
                         "[BLE->DEC L] btn=0x%06x dpad=%c%c%c%c  LS=(%6d,%6d)\n",
                         sideButtons,
                         u ? 'U' : '.', d ? 'D' : '.', l ? 'L' : '.', r ? 'R' : '.',
@@ -491,7 +515,7 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         if (g_debugInput && buffer.size() >= 16) {
             static int lastRX = INT32_MAX, lastRY = INT32_MAX;
             if (g_state.rightStick.x != lastRX || g_state.rightStick.y != lastRY) {
-                fprintf(stderr,
+                debugInputLog(
                         "[BLE->DEC R] raw[13..15]=%02x %02x %02x  RS=(%6d,%6d)\n",
                         buffer[13], buffer[14], buffer[15],
                         g_state.rightStick.x, g_state.rightStick.y);
@@ -636,7 +660,7 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
                 bool bD = report.buttons & (1u << 13);
                 bool bL = report.buttons & (1u << 14);
                 bool bR = report.buttons & (1u << 15);
-                fprintf(stderr,
+                debugInputLog(
                         "[HID-TX] btn=0x%05x dpadBits=%c%c%c%c hat=%u "
                         "LS=(%6d,%6d) RS=(%6d,%6d) T=(%3u,%3u)\n",
                         report.buttons,
@@ -700,9 +724,20 @@ int main(int argc, const char * argv[]) {
             else if (arg == "--json") g_emitJSON = true;
             else if (arg == "--json-file" && i + 1 < argc) {
                 g_emitJSON = true;
-                g_jsonFile = fopen(argv[++i], "a");
+                const char *jsonPath = argv[++i];
+                g_jsonFile = fopen(jsonPath, "a");
                 if (g_jsonFile) {
                     setvbuf(g_jsonFile, nullptr, _IOLBF, 0);
+                }
+                // Mirror the debug-input trace next to daemon.jsonl so you
+                // can `tail -f ~/Library/Application Support/JoyCon2Mac/input-trace.log`
+                // without digging through the unified system log.
+                NSString *jsonNSPath = [NSString stringWithUTF8String:jsonPath];
+                NSString *traceNSPath = [[jsonNSPath stringByDeletingLastPathComponent]
+                                          stringByAppendingPathComponent:@"input-trace.log"];
+                g_debugInputFile = fopen(traceNSPath.UTF8String, "a");
+                if (g_debugInputFile) {
+                    setvbuf(g_debugInputFile, nullptr, _IOLBF, 0);
                 }
             }
             else if (arg == "--control-file" && i + 1 < argc) {
@@ -713,14 +748,18 @@ int main(int argc, const char * argv[]) {
             }
             else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
             else if (arg == "--no-gamepad") g_enableGamepad = false;
-            else if (arg == "--debug-input") g_debugInput = true;
+            else if (arg == "--no-debug-input") g_debugInput = false;
         }
         
         printUsage();
         emitDaemonEvent("started", "joycon2mac daemon main entered");
         if (g_debugInput) {
-            fprintf(stderr, "[debug-input] targeted tracing enabled: "
-                            "[BLE->DEC L/R] + [HID-TX] on stderr, change-triggered only\n");
+            if (g_debugInputFile) {
+                fprintf(stderr, "[debug-input] tracing on; tail -f "
+                                "~/Library/Application\\ Support/JoyCon2Mac/input-trace.log\n");
+            } else {
+                fprintf(stderr, "[debug-input] tracing on (stderr only; --json-file not set)\n");
+            }
         }
         
         PairingManager *pairingManager = [PairingManager sharedManager];
@@ -765,6 +804,10 @@ int main(int argc, const char * argv[]) {
         if (g_jsonFile) {
             fclose(g_jsonFile);
             g_jsonFile = nullptr;
+        }
+        if (g_debugInputFile) {
+            fclose(g_debugInputFile);
+            g_debugInputFile = nullptr;
         }
     }
     return 0;

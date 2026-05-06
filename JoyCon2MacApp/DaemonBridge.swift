@@ -321,24 +321,15 @@ class DaemonBridge: ObservableObject {
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = false
             configuration.createsNewApplicationInstance = true
-            // Forward --debug-input when JOYCON_DEBUG_INPUT=1 so you can
-            // enable the change-triggered [BLE->DEC L/R] + [HID-TX] trace
-            // without editing source:
-            //   JOYCON_DEBUG_INPUT=1 open build/JoyCon2Mac.app
-            // The trace lives on the daemon's stderr, which the helper
-            // .app routes to `stderr.log` inside its container so you can
-            //   tail -f ~/Library/Containers/local.joycon2mac.daemon/Data/stderr.log
-            // or just `log stream --predicate 'process == "joycon2mac"'`.
-            var daemonArgs: [String] = [
+            // The daemon's change-triggered input trace is on by default and
+            // mirrors to ~/Library/Application Support/JoyCon2Mac/input-trace.log
+            // so you can just `tail -f` that file while playing. To turn it
+            // off: edit the daemon args below and add "--no-debug-input".
+            configuration.arguments = [
                 "--json",
                 "--json-file", logPath.path,
                 "--control-file", controlPath.path
             ]
-            if ProcessInfo.processInfo.environment["JOYCON_DEBUG_INPUT"] == "1" {
-                daemonArgs.append("--debug-input")
-                TelemetryStore.shared.append("[daemon] --debug-input enabled via JOYCON_DEBUG_INPUT=1")
-            }
-            configuration.arguments = daemonArgs
 
             isDaemonRunning = true
             startLogPolling()
