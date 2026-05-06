@@ -7,30 +7,40 @@ enum class JoyConSide { Left, Right };
 enum class JoyConOrientation { Upright, Sideways };
 enum class GyroSource { Both, Left, Right };
 
-// Button masks for Left Joy-Con (buffer[5] << 8 | buffer[6])
-constexpr uint32_t BTN_LEFT_DOWN    = 0x0001;
-constexpr uint32_t BTN_LEFT_UP      = 0x0002;
-constexpr uint32_t BTN_LEFT_RIGHT   = 0x0004;
-constexpr uint32_t BTN_LEFT_LEFT    = 0x0008;
-constexpr uint32_t BTN_LEFT_SRL     = 0x0010;
-constexpr uint32_t BTN_LEFT_SLL     = 0x0020;
-constexpr uint32_t BTN_LEFT_L       = 0x0040;
-constexpr uint32_t BTN_LEFT_ZL      = 0x0080;
-constexpr uint32_t BTN_LEFT_MINUS   = 0x0100;
-constexpr uint32_t BTN_LEFT_L3      = 0x0800;
-constexpr uint32_t BTN_LEFT_CAPTURE = 0x2000;
+// Button masks — copied from joycon2cpp/testapp/src/JoyConDecoder.cpp.
+// ExtractButtonState returns a 24-bit state packed from 3 bytes of the BLE
+// input report (byte offset depends on side; see the .cpp implementation).
+// These masks are meant to be applied against the value returned by
+// ExtractButtonState(buffer, side).
 
-// Button masks for Right Joy-Con (buffer[4] << 8 | buffer[5])
-constexpr uint32_t BTN_RIGHT_A      = 0x0008;
-constexpr uint32_t BTN_RIGHT_B      = 0x0002;
-constexpr uint32_t BTN_RIGHT_X      = 0x0004;
-constexpr uint32_t BTN_RIGHT_Y      = 0x0001;
-constexpr uint32_t BTN_RIGHT_PLUS   = 0x0002;
-constexpr uint32_t BTN_RIGHT_R      = 0x0040;
-constexpr uint32_t BTN_RIGHT_ZR     = 0x0080;
-constexpr uint32_t BTN_RIGHT_R3     = 0x0004;
-constexpr uint32_t BTN_RIGHT_HOME   = 0x1000;
-constexpr uint32_t BTN_RIGHT_CHAT   = 0x0040;  // Chat button (Switch 2 specific)
+// Left Joy-Con
+constexpr uint32_t BTN_LEFT_DOWN    = 0x000001;
+constexpr uint32_t BTN_LEFT_UP      = 0x000002;
+constexpr uint32_t BTN_LEFT_RIGHT   = 0x000004;
+constexpr uint32_t BTN_LEFT_LEFT    = 0x000008;
+constexpr uint32_t BTN_LEFT_SRL     = 0x000010;
+constexpr uint32_t BTN_LEFT_SLL     = 0x000020;
+constexpr uint32_t BTN_LEFT_L       = 0x000040;
+constexpr uint32_t BTN_LEFT_ZL      = 0x000080;
+constexpr uint32_t BTN_LEFT_MINUS   = 0x000100;
+constexpr uint32_t BTN_LEFT_L3      = 0x000800;
+constexpr uint32_t BTN_LEFT_CAPTURE = 0x002000;
+
+// Right Joy-Con
+constexpr uint32_t BTN_RIGHT_Y      = 0x000100;
+constexpr uint32_t BTN_RIGHT_X      = 0x000400;
+constexpr uint32_t BTN_RIGHT_B      = 0x000200;
+constexpr uint32_t BTN_RIGHT_A      = 0x000800;
+constexpr uint32_t BTN_RIGHT_SRR    = 0x001000;
+constexpr uint32_t BTN_RIGHT_SLR    = 0x002000;
+constexpr uint32_t BTN_RIGHT_R      = 0x004000;
+constexpr uint32_t BTN_RIGHT_ZR     = 0x008000;
+constexpr uint32_t BTN_RIGHT_PLUS   = 0x000002;
+constexpr uint32_t BTN_RIGHT_R3     = 0x000004;
+constexpr uint32_t BTN_RIGHT_HOME   = 0x000010;
+// Chat / "C" button introduced on Switch 2 Right Joy-Con.
+// joycon2cpp uses this bit to toggle optical-mouse mode.
+constexpr uint32_t BTN_RIGHT_CHAT   = 0x000040;
 
 struct StickData {
     int16_t x;

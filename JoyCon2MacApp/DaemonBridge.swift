@@ -133,6 +133,12 @@ class DaemonBridge: ObservableObject {
 
     // MARK: - Lifecycle
 
+    // Generation counter — every time we (re)start, we bump this. Any
+    // stale termination callback from a previously-stopped daemon checks
+    // its captured generation against the current one and ignores itself
+    // if they don't match. That kept a dying Stop from nuking a fresh Start.
+    private var daemonGeneration: UInt64 = 0
+
     func startDaemon() {
         if let daemonProcess, daemonProcess.isRunning {
             isDaemonRunning = true
@@ -142,14 +148,26 @@ class DaemonBridge: ObservableObject {
             isDaemonRunning = true
             return
         }
+
+        // Belt-and-braces: kill any stragglers of our helper bundle before
+        // starting. NSWorkspace.openApplication will otherwise reuse the
+        // dying instance and the new Start silently no-ops.
+        for app in NSRunningApplication.runningApplications(withBundleIdentifier: "local.joycon2mac.daemon") {
+            Darwin.kill(app.processIdentifier, SIGKILL)
+        }
+
         shouldRestartAfterTermination = false
         daemonProcess = nil
+        daemonApplication = nil
+        outputPipe = nil
         controllers.removeAll()
         ingestQueue.async { [weak self] in
             self?.lastIngestTime.removeAll()
         }
+        daemonGeneration &+= 1
+        let myGeneration = daemonGeneration
 
-        if startBundledDaemonApp() {
+        if startBundledDaemonApp(generation: myGeneration) {
             return
         }
 
@@ -187,8 +205,6 @@ class DaemonBridge: ObservableObject {
             guard let output = String(data: data, encoding: .utf8) else {
                 return
             }
-            // NEVER parse on this callback's queue directly; dispatch to
-            // ingest queue so the main thread never sees this work.
             self?.ingestQueue.async {
                 self?.parseDaemonOutputOnIngestQueue(output)
             }
@@ -196,17 +212,21 @@ class DaemonBridge: ObservableObject {
 
         process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                let shouldRestart = self?.shouldRestartAfterTermination ?? false
-                self?.shouldRestartAfterTermination = false
-                self?.daemonProcess = nil
-                self?.daemonApplication = nil
-                self?.outputPipe = nil
-                self?.stopLogPolling()
-                self?.isDaemonRunning = false
+                guard let self else { return }
+                // If a newer generation has already started, this termination
+                // belongs to an older instance. Swallow it.
+                if myGeneration != self.daemonGeneration { return }
+                let shouldRestart = self.shouldRestartAfterTermination
+                self.shouldRestartAfterTermination = false
+                self.daemonProcess = nil
+                self.daemonApplication = nil
+                self.outputPipe = nil
+                self.stopLogPolling()
+                self.isDaemonRunning = false
                 if shouldRestart {
-                    self?.startDaemon()
+                    self.startDaemon()
                 } else {
-                    self?.markControllersDisconnected(status: "daemonStopped")
+                    self.markControllersDisconnected(status: "daemonStopped")
                 }
             }
         }
@@ -221,15 +241,27 @@ class DaemonBridge: ObservableObject {
         }
     }
 
-    private func startBundledDaemonApp() -> Bool {
+    private func startBundledDaemonApp(generation: UInt64) -> Bool {
         guard let helperApp = Bundle.main.resourceURL?.appendingPathComponent("JoyCon2MacDaemon.app"),
               FileManager.default.fileExists(atPath: helperApp.path) else {
             return false
         }
 
         do {
-            for app in NSRunningApplication.runningApplications(withBundleIdentifier: "local.joycon2mac.daemon") {
-                Darwin.kill(app.processIdentifier, SIGKILL)
+            // Wait briefly for any previous helper processes to actually die
+            // before relaunching. Without this, LaunchServices can refuse the
+            // relaunch request or fold us into the still-dying instance, and
+            // Start appears to do nothing.
+            var attempts = 0
+            while attempts < 10 {
+                let existing = NSRunningApplication.runningApplications(withBundleIdentifier: "local.joycon2mac.daemon")
+                    .filter { !$0.isTerminated }
+                if existing.isEmpty { break }
+                for app in existing {
+                    Darwin.kill(app.processIdentifier, SIGKILL)
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+                attempts += 1
             }
 
             let supportDir = try FileManager.default.url(
@@ -263,14 +295,22 @@ class DaemonBridge: ObservableObject {
 
             NSWorkspace.shared.openApplication(at: helperApp, configuration: configuration) { [weak self] app, error in
                 DispatchQueue.main.async {
+                    guard let self else { return }
+                    if generation != self.daemonGeneration { return }
                     if let error {
                         TelemetryStore.shared.append("Failed to start helper daemon: \(error)")
-                        self?.isDaemonRunning = false
-                        self?.stopLogPolling()
-                        self?.markControllersDisconnected(status: "daemonStopped")
+                        self.isDaemonRunning = false
+                        self.stopLogPolling()
+                        self.markControllersDisconnected(status: "daemonStopped")
                         return
                     }
-                    self?.daemonApplication = app
+                    self.daemonApplication = app
+                    // Observe termination so we can flip the running flag
+                    // if the helper dies unexpectedly. pollDaemonLog also
+                    // catches this but the observer reacts faster.
+                    if let app {
+                        self.observeDaemonTermination(app: app, generation: generation)
+                    }
                 }
             }
             return true
@@ -280,9 +320,24 @@ class DaemonBridge: ObservableObject {
         }
     }
 
+    private var daemonTerminationObservation: NSKeyValueObservation?
+
+    private func observeDaemonTermination(app: NSRunningApplication, generation: UInt64) {
+        daemonTerminationObservation?.invalidate()
+        daemonTerminationObservation = app.observe(\.isTerminated, options: [.new]) { [weak self] _, change in
+            guard let self, change.newValue == true else { return }
+            DispatchQueue.main.async {
+                if generation != self.daemonGeneration { return }
+                self.handleDaemonTerminated()
+            }
+        }
+    }
+
     func stopDaemon() {
         isDaemonRunning = false
         outputPipe?.fileHandleForReading.readabilityHandler = nil
+        daemonTerminationObservation?.invalidate()
+        daemonTerminationObservation = nil
 
         if let daemonApplication {
             let pid = daemonApplication.processIdentifier
