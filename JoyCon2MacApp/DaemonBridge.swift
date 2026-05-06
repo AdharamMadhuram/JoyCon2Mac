@@ -150,6 +150,49 @@ class DaemonBridge: ObservableObject {
     private var ingestPacketDropLeft: UInt64 = 0
     private var ingestPacketDropRight: UInt64 = 0
 
+    // End-to-end input trace. The daemon writes [BLE->DEC L/R] (what the
+    // decoder produced from the BLE packet) and [HID-TX] (what gets
+    // shipped to the DriverKit extension → Chrome/games) into
+    // ~/Library/Application Support/JoyCon2Mac/input-trace.log. We append
+    // [UI R] / [UI L] lines to the same file so you can diff all three
+    // pipeline stages in one place:
+    //
+    //   [BLE->DEC R]   = physical stick value the daemon just decoded
+    //   [UI R]         = value the GUI ingested from JSON and will display
+    //   [HID-TX] RS=…  = value the daemon shipped to the dext (→ Chrome)
+    //
+    // If [BLE->DEC R] shows motion and [UI R] doesn't, the JSON emitter
+    // is broken. If [UI R] shows motion and [HID-TX] doesn't, something
+    // in the gamepad-report build path is dropping it. If [HID-TX] is
+    // correct and games still see nothing, the dext/descriptor is the
+    // problem. Change-triggered, zero noise when idle.
+    private var traceFileHandle: FileHandle?
+    private var lastTraceRightX: Int16 = .min
+    private var lastTraceRightY: Int16 = .min
+    private var lastTraceLeftX: Int16 = .min
+    private var lastTraceLeftY: Int16 = .min
+
+    private func openTraceFile(at url: URL) {
+        // Daemon opens the same file in append mode. Trust the daemon to
+        // create it; we just re-open for append on our side so both
+        // processes can write without clobbering each other's lines. No
+        // cross-process locking because each process writes whole lines
+        // (<256 B) which POSIX append-mode treats atomically.
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        traceFileHandle = try? FileHandle(forWritingTo: url)
+        try? traceFileHandle?.seekToEnd()
+    }
+
+    private func writeTrace(_ line: String) {
+        guard let fh = traceFileHandle else { return }
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        try? fh.write(contentsOf: data)
+    }
+
     private init() {
         startDaemon()
     }
@@ -309,6 +352,14 @@ class DaemonBridge: ObservableObject {
             try Data().write(to: controlPath, options: .atomic)
             daemonControlPath = controlPath
             TelemetryStore.shared.setLogPath(logPath)
+            // Open (shared-append) the same input-trace.log the daemon is
+            // going to write [BLE->DEC] and [HID-TX] lines into. Our side
+            // appends [UI R] / [UI L] lines on JSON ingest so a single
+            // `tail -f` on this one file shows all three pipeline stages.
+            let tracePath = supportDir.appendingPathComponent("input-trace.log")
+            // Truncate so each session's trace starts clean.
+            try? Data().write(to: tracePath, options: .atomic)
+            openTraceFile(at: tracePath)
             controllers.removeAll()
             ingestQueue.async { [weak self] in
                 self?.lastIngestTime.removeAll()
@@ -559,6 +610,32 @@ class DaemonBridge: ObservableObject {
             scheduleMainApplyLocked()
         case "state":
             let snapshot = buildControllerState(from: object)
+            // [UI R]/[UI L] — what the GUI just ingested and will render.
+            // Change-triggered so idle frames don't spam the log. Compared
+            // against [BLE->DEC R/L] (daemon decoder output) and [HID-TX]
+            // (what got shipped to the HID driver), it pinpoints where a
+            // missing input is lost: decoder, IPC/JSON, UI, or dext.
+            if snapshot.side == "right" {
+                if snapshot.rightStickX != lastTraceRightX || snapshot.rightStickY != lastTraceRightY {
+                    writeTrace(String(
+                        format: "[UI R] RS=(%6d,%6d) LS=(%6d,%6d) btn=0x%06x",
+                        snapshot.rightStickX, snapshot.rightStickY,
+                        snapshot.leftStickX, snapshot.leftStickY,
+                        snapshot.buttons))
+                    lastTraceRightX = snapshot.rightStickX
+                    lastTraceRightY = snapshot.rightStickY
+                }
+            } else {
+                if snapshot.leftStickX != lastTraceLeftX || snapshot.leftStickY != lastTraceLeftY {
+                    writeTrace(String(
+                        format: "[UI L] LS=(%6d,%6d) RS=(%6d,%6d) btn=0x%06x",
+                        snapshot.leftStickX, snapshot.leftStickY,
+                        snapshot.rightStickX, snapshot.rightStickY,
+                        snapshot.buttons))
+                    lastTraceLeftX = snapshot.leftStickX
+                    lastTraceLeftY = snapshot.leftStickY
+                }
+            }
             pendingStateSnapshots[snapshot.id] = snapshot
             scheduleMainApplyLocked()
         case "nfc":

@@ -47,36 +47,8 @@ StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, Jo
 
     const uint8_t* data = isLeft ? &buffer[10] : &buffer[13];
 
-    // Nibble layout on Switch 2 BLE notifications:
-    //   Left Joy-Con (offset 0x0A..0x0C, own packet):
-    //     byte0 = X low, byte1 = (Y_lo << 4) | X_hi, byte2 = Y high
-    //     → x = ((b1 & 0x0F) << 8) | b0
-    //       y = (b2 << 4) | ((b1 & 0xF0) >> 4)
-    //
-    //   Right Joy-Con (offset 0x0D..0x0F, own packet):
-    //     byte0 = Y low, byte1 = (X_lo << 4) | Y_hi, byte2 = X high
-    //     → y = ((b1 & 0x0F) << 8) | b0
-    //       x = (b2 << 4) | ((b1 & 0xF0) >> 4)
-    //
-    // Why the right side is different: the [BLE->DEC R] trace showed
-    // physical stick left/right driving byte 15 (the one that sits in
-    // the high half of the 12-bit value), while the 12-bit Y unpack
-    // stayed near a constant. Swapping which nibble group goes into X
-    // vs Y makes both axes track the physical stick correctly. In-game
-    // symptom before the fix: right-stick left/right scrolled the
-    // camera up/down (our Y axis was carrying X motion) and right-stick
-    // up/down did nothing (our X axis was reading the stable 8-bit
-    // byte). joycon2cpp's Windows testapp sourced the right stick from
-    // a composite Pro-Controller report where the nibbles were already
-    // pre-swapped; a per-side BLE packet hands us the native layout.
-    int x_raw, y_raw;
-    if (isLeft) {
-        x_raw = ((data[1] & 0x0F) << 8) | data[0];
-        y_raw = (data[2] << 4) | ((data[1] & 0xF0) >> 4);
-    } else {
-        y_raw = ((data[1] & 0x0F) << 8) | data[0];
-        x_raw = (data[2] << 4) | ((data[1] & 0xF0) >> 4);
-    }
+    int x_raw = ((data[1] & 0x0F) << 8) | data[0];
+    int y_raw = (data[2] << 4) | ((data[1] & 0xF0) >> 4);
 
     float x = (x_raw - 2048) / 2048.0f;
     float y = (y_raw - 2048) / 2048.0f;
