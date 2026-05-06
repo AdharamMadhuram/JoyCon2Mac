@@ -16,7 +16,12 @@ struct ControllerState {
     uint32_t rightButtons = 0;
     StickData leftStick = {0, 0, 0, 0};
     StickData rightStick = {0, 0, 0, 0};
-    MotionData motion = {0, 0, 0, 0, 0, 0};
+    // joycon2cpp emits IMU data per-side (each Joy-Con has its own accel +
+    // gyro). Keep the last-seen samples separately so the UI can show stable
+    // readouts for each side instead of one struct that flickers between
+    // whichever controller pushed the most recent BLE notification.
+    MotionData motionLeft  = {0, 0, 0, 0, 0, 0};
+    MotionData motionRight = {0, 0, 0, 0, 0, 0};
     MouseData mouse = {0, 0, 0};
     BatteryData battery = {0, 0, 0, -1};
     uint8_t triggerL = 0;
@@ -37,6 +42,14 @@ static NSDate *g_lastJSONRightTime = nil;
 static DriverKitClient *g_driverClient = nil;
 static MouseEmitter *g_mouseEmitter = nil;
 static BLEManager *g_bleManager = nil;
+// Control-file IPC. The GUI writes one JSON command per line into this file
+// (e.g. {"cmd":"setMouseMode","value":2}). We poll it on a GCD timer and
+// apply any new lines. Kept deliberately simple: no XPC, no Mach ports, no
+// signing entitlements — just a file in Application Support the daemon
+// already owns exclusively.
+static NSString *g_controlFilePath = nil;
+static unsigned long long g_controlFileOffset = 0;
+static dispatch_source_t g_controlFileTimer = nullptr;
 
 static void emitJSONLine(const std::string& line) {
     std::cout << line << std::endl;
@@ -135,6 +148,118 @@ void toggleMouseMode() {
     }
 }
 
+// Apply one control command from the GUI. Kept as a small dispatch so we
+// can extend it later (rumble trigger, re-pair, etc.) without rewriting
+// the polling loop.
+static void applyControlCommand(NSDictionary *command) {
+    NSString *cmd = command[@"cmd"];
+    if (![cmd isKindOfClass:[NSString class]]) return;
+
+    if ([cmd isEqualToString:@"setMouseMode"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        int raw = value.intValue;
+        if (raw < 0 || raw > 3) return;
+        MouseMode target = (MouseMode)raw;
+        if (g_mouseEmitter.currentMode == target) {
+            emitDaemonEvent("mouseMode", [[NSString stringWithFormat:@"already=%d", raw] UTF8String]);
+            return;
+        }
+        g_mouseEmitter.currentMode = target;
+        uint8_t ledPattern = 0x01;
+        const char *modeName = "OFF";
+        switch (target) {
+            case MouseModeFast:   modeName = "FAST";   ledPattern = 0x02; break;
+            case MouseModeNormal: modeName = "NORMAL"; ledPattern = 0x04; break;
+            case MouseModeSlow:   modeName = "SLOW";   ledPattern = 0x08; break;
+            default: break;
+        }
+        if (g_bleManager) {
+            [g_bleManager setPlayerLED:ledPattern];
+        }
+        emitDaemonEvent("mouseMode",
+                        [[NSString stringWithFormat:@"applied=%s (%d)", modeName, raw] UTF8String]);
+        std::cout << "[Control] Mouse mode set to " << modeName << std::endl;
+    } else if ([cmd isEqualToString:@"toggleMouseMode"]) {
+        toggleMouseMode();
+    } else {
+        emitDaemonEvent("controlUnknown",
+                        [[NSString stringWithFormat:@"unknown cmd=%@", cmd] UTF8String]);
+    }
+}
+
+static void pollControlFile() {
+    if (!g_controlFilePath) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:g_controlFilePath]) {
+        g_controlFileOffset = 0;
+        return;
+    }
+    NSError *err = nil;
+    NSDictionary *attrs = [fm attributesOfItemAtPath:g_controlFilePath error:&err];
+    if (!attrs) return;
+    unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+    if (size < g_controlFileOffset) {
+        // File was truncated or rotated. Rewind.
+        g_controlFileOffset = 0;
+    }
+    if (size <= g_controlFileOffset) return;
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:g_controlFilePath];
+    if (!fh) return;
+    @try {
+        [fh seekToFileOffset:g_controlFileOffset];
+        NSData *data = [fh readDataToEndOfFile];
+        g_controlFileOffset = [fh offsetInFile];
+        [fh closeFile];
+        if (data.length == 0) return;
+        NSString *chunk = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        for (NSString *rawLine in [chunk componentsSeparatedByString:@"\n"]) {
+            NSString *line = [rawLine stringByTrimmingCharactersInSet:
+                                  [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (line.length == 0) continue;
+            NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+            NSError *jsonErr = nil;
+            id obj = [NSJSONSerialization JSONObjectWithData:lineData
+                                                     options:0
+                                                       error:&jsonErr];
+            if ([obj isKindOfClass:[NSDictionary class]]) {
+                applyControlCommand((NSDictionary *)obj);
+            }
+        }
+    } @catch (NSException *e) {
+        [fh closeFile];
+    }
+}
+
+static void startControlFilePolling(NSString *path) {
+    if (!path) return;
+    g_controlFilePath = [path copy];
+    // Ensure the file exists so the GUI's append-open doesn't race us, and
+    // so we know where the read cursor is.
+    if (![[NSFileManager defaultManager] fileExistsAtPath:g_controlFilePath]) {
+        [[NSFileManager defaultManager] createFileAtPath:g_controlFilePath
+                                                contents:nil
+                                              attributes:nil];
+    }
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:g_controlFilePath error:nil];
+    g_controlFileOffset = [attrs[NSFileSize] unsignedLongLongValue];
+
+    dispatch_queue_t queue = dispatch_get_main_queue();
+    g_controlFileTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(g_controlFileTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                              (uint64_t)(0.1 * NSEC_PER_SEC),
+                              (uint64_t)(0.02 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(g_controlFileTimer, ^{
+        pollControlFile();
+    });
+    dispatch_resume(g_controlFileTimer);
+    emitDaemonEvent("controlFile", [[NSString stringWithFormat:@"path=%@", path] UTF8String]);
+}
+
+
 void printControllerState() {
     if (g_emitJSON) {
         return;
@@ -179,10 +304,16 @@ void printDetailedState() {
     std::cout << "  Right: X=" << g_state.rightStick.x << " Y=" << g_state.rightStick.y << "\n";
     
     std::cout << "\nMotion (IMU):\n";
-    std::cout << "  Gyro:  X=" << std::fixed << std::setprecision(2) << g_state.motion.gyroX 
-              << "° Y=" << g_state.motion.gyroY << "° Z=" << g_state.motion.gyroZ << "°/s\n";
-    std::cout << "  Accel: X=" << g_state.motion.accelX 
-              << "G Y=" << g_state.motion.accelY << "G Z=" << g_state.motion.accelZ << "G\n";
+    // Print whichever side pushed the most recent packet. The per-side
+    // slots above keep Left and Right separate for the JSON emitter; for
+    // the human-readable dump we show the side we just received from so
+    // the readout tracks the controller the user is moving.
+    const MotionData &motion =
+        g_state.lastSide == JoyConSide::Right ? g_state.motionRight : g_state.motionLeft;
+    std::cout << "  Gyro:  X=" << std::fixed << std::setprecision(2) << motion.gyroX
+              << "° Y=" << motion.gyroY << "° Z=" << motion.gyroZ << "°/s\n";
+    std::cout << "  Accel: X=" << motion.accelX
+              << "G Y=" << motion.accelY << "G Z=" << motion.accelZ << "G\n";
     
     std::cout << "\nMouse:\n";
     std::cout << "  Delta: X=" << g_state.mouse.deltaX << " Y=" << g_state.mouse.deltaY << "\n";
@@ -229,6 +360,11 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
 
     const char *sideName = side == JoyConSide::Right ? "right" : "left";
     StickData sideStick = side == JoyConSide::Right ? g_state.rightStick : g_state.leftStick;
+    // Match the per-side MotionData slot so a state line for the Left Joy-Con
+    // only reports the Left IMU (and vice versa). Without this, the UI saw
+    // the same gyro/accel trio for both controllers, which is the "wonky 3D
+    // cube that doesn't match the physical Joy-Con" symptom.
+    const MotionData &sideMotion = side == JoyConSide::Right ? g_state.motionRight : g_state.motionLeft;
     int mouseMode = g_mouseEmitter ? (int)g_mouseEmitter.currentMode : 0;
 
     std::ostringstream out;
@@ -246,12 +382,12 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         << "\"leftStickY\":" << g_state.leftStick.y << ","
         << "\"rightStickX\":" << g_state.rightStick.x << ","
         << "\"rightStickY\":" << g_state.rightStick.y << ","
-        << "\"gyroX\":" << g_state.motion.gyroX << ","
-        << "\"gyroY\":" << g_state.motion.gyroY << ","
-        << "\"gyroZ\":" << g_state.motion.gyroZ << ","
-        << "\"accelX\":" << g_state.motion.accelX << ","
-        << "\"accelY\":" << g_state.motion.accelY << ","
-        << "\"accelZ\":" << g_state.motion.accelZ << ","
+        << "\"gyroX\":" << sideMotion.gyroX << ","
+        << "\"gyroY\":" << sideMotion.gyroY << ","
+        << "\"gyroZ\":" << sideMotion.gyroZ << ","
+        << "\"accelX\":" << sideMotion.accelX << ","
+        << "\"accelY\":" << sideMotion.accelY << ","
+        << "\"accelZ\":" << sideMotion.accelZ << ","
         << "\"mouseX\":" << g_state.mouse.deltaX << ","
         << "\"mouseY\":" << g_state.mouse.deltaY << ","
         << "\"mouseDistance\":" << g_state.mouse.distance << ","
@@ -281,7 +417,14 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     }
 
     g_state.buttons = sideButtons;
-    g_state.motion = DecodeMotion(buffer, side);
+    // Write motion into the per-side slot. The JSON emitter below picks the
+    // matching slot so gyroX/gyroY/gyroZ for the left packet never bleed
+    // into the right controller's telemetry row and vice versa.
+    if (side == JoyConSide::Left) {
+        g_state.motionLeft = DecodeMotion(buffer, side);
+    } else {
+        g_state.motionRight = DecodeMotion(buffer, side);
+    }
     g_state.mouse = DecodeMouse(buffer);
     g_state.battery = DecodeBattery(buffer);
     auto triggers = DecodeAnalogTriggers(buffer);
@@ -391,6 +534,12 @@ int main(int argc, const char * argv[]) {
                     setvbuf(g_jsonFile, nullptr, _IOLBF, 0);
                 }
             }
+            else if (arg == "--control-file" && i + 1 < argc) {
+                // Path must come from the GUI, which creates the file inside
+                // Application Support/JoyCon2Mac and passes the same path we
+                // pass to --json-file. Store for post-init wiring.
+                g_controlFilePath = [NSString stringWithUTF8String:argv[++i]];
+            }
             else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
             else if (arg == "--no-gamepad") g_enableGamepad = false;
         }
@@ -412,6 +561,13 @@ int main(int argc, const char * argv[]) {
             emitDaemonEvent("driverMissing", "VirtualJoyConDriver not loaded; using CGEvent mouse fallback only");
         }
         g_mouseEmitter = [[MouseEmitter alloc] initWithDriverClient:g_driverClient];
+
+        // Now that g_mouseEmitter + g_bleManager exist, hook up the GUI
+        // control channel if a path was passed. Polls at 10 Hz on the main
+        // queue, so mouse-mode changes show up within ~100ms.
+        if (g_controlFilePath) {
+            startControlFilePolling(g_controlFilePath);
+        }
         
         std::cout << "Starting BLE manager...\n\n";
         

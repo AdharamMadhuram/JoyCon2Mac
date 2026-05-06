@@ -36,16 +36,23 @@ struct MouseView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Mouse Mode")
                         .font(.headline)
-                    
-                    Picker("Mode", selection: $selectedMode) {
+
+                    // Bind picker selection to the daemon-authoritative
+                    // mirror in the first controller. Changing the picker
+                    // forwards to the daemon through the control channel;
+                    // the picker snaps back if the daemon disagrees.
+                    Picker("Mode", selection: Binding<MouseMode>(
+                        get: { daemonBridge.controllers.first?.mouseMode ?? .off },
+                        set: { daemonBridge.setMouseMode($0) }
+                    )) {
                         Text("Off").tag(MouseMode.off)
                         Text("Slow").tag(MouseMode.slow)
                         Text("Normal").tag(MouseMode.normal)
                         Text("Fast").tag(MouseMode.fast)
                     }
                     .pickerStyle(.segmented)
-                    
-                    Text("Press the Capture button on your Joy-Con to toggle modes")
+
+                    Text("Press the Chat (C) button on the Right Joy-Con, or use the buttons above, to cycle mouse modes")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

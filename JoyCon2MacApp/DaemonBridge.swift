@@ -117,6 +117,10 @@ class DaemonBridge: ObservableObject {
     private var logPollTimer: DispatchSourceTimer?
     private var daemonLogPath: URL?
     private var daemonLogOffset: UInt64 = 0
+    // Path the daemon polls for GUI → daemon commands (mouse-mode toggle etc).
+    // Stored as URL so we can append with NSFileHandle without re-resolving
+    // the Application Support directory each time.
+    private var daemonControlPath: URL?
     // Diagnostic counters bumped on ingestQueue; snapshotted for logs.
     private var ingestPacketCountLeft: UInt64 = 0
     private var ingestPacketCountRight: UInt64 = 0
@@ -275,6 +279,12 @@ class DaemonBridge: ObservableObject {
             try Data().write(to: logPath, options: .atomic)
             daemonLogPath = logPath
             daemonLogOffset = 0
+            // Control-channel file. GUI writes one JSON command per line,
+            // daemon polls. Truncate on start so stale commands from a
+            // previous session don't get re-applied.
+            let controlPath = supportDir.appendingPathComponent("control.jsonl")
+            try Data().write(to: controlPath, options: .atomic)
+            daemonControlPath = controlPath
             TelemetryStore.shared.setLogPath(logPath)
             controllers.removeAll()
             ingestQueue.async { [weak self] in
@@ -288,7 +298,11 @@ class DaemonBridge: ObservableObject {
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = false
             configuration.createsNewApplicationInstance = true
-            configuration.arguments = ["--json", "--json-file", logPath.path]
+            configuration.arguments = [
+                "--json",
+                "--json-file", logPath.path,
+                "--control-file", controlPath.path
+            ]
 
             isDaemonRunning = true
             startLogPolling()
@@ -705,13 +719,60 @@ class DaemonBridge: ObservableObject {
     // MARK: - Misc
 
     func toggleMouseMode() {
-        if let controller = controllers.first {
-            let nextRaw = (controller.mouseMode.rawValue + 1) % 4
-            let newMode = MouseMode(rawValue: nextRaw) ?? .off
+        // The mouse emitter lives in the daemon, so the authoritative mouse
+        // mode is whatever g_mouseEmitter.currentMode says. Pick the next
+        // value based on our last-seen mirror and forward the target to the
+        // daemon via the control file. The daemon echoes "mouseMode" events
+        // back in telemetry, which will update the ControllerState mirror
+        // through the normal state-parse pipeline on the next packet.
+        let currentRaw = controllers.first?.mouseMode.rawValue ?? 0
+        let nextRaw = (currentRaw + 1) % 4
+        sendControlCommand(["cmd": "setMouseMode", "value": nextRaw])
+
+        // Optimistic UI update so the picker / toggle button shows the new
+        // state immediately; the next state event from the daemon will
+        // correct it if the command was rejected.
+        if !controllers.isEmpty {
             var updated = controllers
-            updated[0].mouseMode = newMode
+            updated[0].mouseMode = MouseMode(rawValue: nextRaw) ?? .off
             controllers = updated
             stateRevision &+= 1
+        }
+    }
+
+    func setMouseMode(_ mode: MouseMode) {
+        sendControlCommand(["cmd": "setMouseMode", "value": mode.rawValue])
+        if !controllers.isEmpty {
+            var updated = controllers
+            updated[0].mouseMode = mode
+            controllers = updated
+            stateRevision &+= 1
+        }
+    }
+
+    /// Append one JSON command line to the control file. The daemon polls
+    /// the file at 10 Hz and applies each complete newline-terminated
+    /// object exactly once, so ordering is preserved and partial writes
+    /// aren't picked up until the newline is flushed.
+    private func sendControlCommand(_ payload: [String: Any]) {
+        guard let daemonControlPath else {
+            TelemetryStore.shared.append("[control] daemon not running; dropping command")
+            return
+        }
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              var line = String(data: data, encoding: .utf8) else {
+            return
+        }
+        line.append("\n")
+        guard let bytes = line.data(using: .utf8) else { return }
+        do {
+            let handle = try FileHandle(forWritingTo: daemonControlPath)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: bytes)
+            try handle.close()
+        } catch {
+            TelemetryStore.shared.append("[control] write failed: \(error.localizedDescription)")
         }
     }
 
@@ -743,13 +804,25 @@ class DaemonBridge: ObservableObject {
     }
 
     func installAndLoadDriver() {
-        let embeddedDextURL = Bundle.main.bundleURL
+        // Apple requires the dext filename, CFBundleExecutable, and
+        // CFBundleIdentifier to all agree. Our build pipeline now names the
+        // bundle after the identifier (local.joycon2mac.driver.dext). We
+        // still fall back to the old "VirtualJoyConDriver.dext" path for
+        // .apps produced by pre-rename builds that someone might have
+        // hanging around, but new builds will resolve the first URL.
+        let extensionsDir = Bundle.main.bundleURL
             .appendingPathComponent("Contents")
             .appendingPathComponent("Library")
             .appendingPathComponent("SystemExtensions")
-            .appendingPathComponent("VirtualJoyConDriver.dext")
 
-        guard FileManager.default.fileExists(atPath: embeddedDextURL.path) else {
+        let candidates = [
+            extensionsDir.appendingPathComponent("local.joycon2mac.driver.dext"),
+            extensionsDir.appendingPathComponent("VirtualJoyConDriver.dext")
+        ]
+
+        guard let embeddedDextURL = candidates.first(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }) else {
             let msg = "Driver extension is missing from Contents/Library/SystemExtensions."
             driverInstallStatus = msg
             TelemetryStore.shared.updateDriverStatus(msg)

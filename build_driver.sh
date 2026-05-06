@@ -43,7 +43,12 @@ xcodebuild -project "$BUILD_DIR/JoyCon2Mac.xcodeproj" -target VirtualJoyConDrive
 echo "Step 3: Packaging dext bundle..."
 PRODUCT_DIR="$BUILD_DIR/Release"
 DRIVER_BINARY="$PRODUCT_DIR/libVirtualJoyConDriver.so"
-DEXT_DIR="$PRODUCT_DIR/VirtualJoyConDriver.dext"
+# Apple's System Extensions overview requires the dext filename (without
+# the .dext extension) to be exactly the dext's CFBundleIdentifier. sysextd
+# looks for that file inside Contents/Library/SystemExtensions/ and returns
+# "Extension not found in App bundle" if the names don't line up, even when
+# the Info.plist is otherwise correct.
+DEXT_DIR="$PRODUCT_DIR/local.joycon2mac.driver.dext"
 DEXT_CONTENTS="$DEXT_DIR/Contents"
 DEXT_MACOS="$DEXT_CONTENTS/MacOS"
 
@@ -53,8 +58,13 @@ if [ ! -f "$DRIVER_BINARY" ]; then
 fi
 
 /bin/rm -rf "$DEXT_DIR"
+# Also wipe any stale-named bundle from earlier builds so the app package
+# doesn't end up with both copies side-by-side.
+/bin/rm -rf "$PRODUCT_DIR/VirtualJoyConDriver.dext"
 mkdir -p "$DEXT_MACOS"
-cp "$DRIVER_BINARY" "$DEXT_MACOS/VirtualJoyConDriver"
+# CFBundleExecutable must also match the bundle-id-derived name so the
+# Mach-O inside the bundle can be located by the loader.
+cp "$DRIVER_BINARY" "$DEXT_MACOS/local.joycon2mac.driver"
 cat > "$DEXT_CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -63,13 +73,13 @@ cat > "$DEXT_CONTENTS/Info.plist" <<'PLIST'
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>VirtualJoyConDriver</string>
+    <string>local.joycon2mac.driver</string>
     <key>CFBundleIdentifier</key>
     <string>local.joycon2mac.driver</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>VirtualJoyConDriver</string>
+    <string>local.joycon2mac.driver</string>
     <key>CFBundlePackageType</key>
     <string>DEXT</string>
     <key>CFBundleShortVersionString</key>
