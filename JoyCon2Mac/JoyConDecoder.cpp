@@ -33,11 +33,6 @@ uint32_t ExtractButtonState(const std::vector<uint8_t>& buffer, JoyConSide side)
 }
 
 StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation) {
-    // Exact port of joycon2cpp/testapp/src/JoyConDecoder.cpp DecodeJoystick.
-    // Do not "improve" this — joycon2cpp is the reference that's known to
-    // work on real Switch 2 Joy-Cons. Any calibration deviation (Joy2Win
-    // centers/spans, extra axis negation, deadzone tweak) reintroduces the
-    // mirrored/frozen-stick bugs we hit before.
     if (buffer.size() < 16) {
         return { 0, 0, 0, 0 };
     }
@@ -50,8 +45,39 @@ StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, Jo
     int x_raw = ((data[1] & 0x0F) << 8) | data[0];
     int y_raw = (data[2] << 4) | ((data[1] & 0xF0) >> 4);
 
-    float x = (x_raw - 2048) / 2048.0f;
-    float y = (y_raw - 2048) / 2048.0f;
+    // Per-controller auto-calibration: average the first 30 packets to
+    // find the true resting center, then subtract it before normalizing.
+    // joycon2cpp on Windows skips this because ViGEm/XInput handles it,
+    // but on macOS the raw 12-bit values have a per-unit offset (e.g.
+    // y_raw=1866 at rest instead of 2048) that leaks through the deadzone
+    // and registers as a constant stick push in games.
+    static int leftCenterX = 2048, leftCenterY = 2048;
+    static int rightCenterX = 2048, rightCenterY = 2048;
+    static int leftCalSamples = 0, rightCalSamples = 0;
+    static long long leftSumX = 0, leftSumY = 0;
+    static long long rightSumX = 0, rightSumY = 0;
+    static const int CAL_SAMPLES = 30;
+
+    int &centerX = isLeft ? leftCenterX : rightCenterX;
+    int &centerY = isLeft ? leftCenterY : rightCenterY;
+    int &calSamples = isLeft ? leftCalSamples : rightCalSamples;
+    long long &sumX = isLeft ? leftSumX : rightSumX;
+    long long &sumY = isLeft ? leftSumY : rightSumY;
+
+    if (calSamples < CAL_SAMPLES) {
+        sumX += x_raw;
+        sumY += y_raw;
+        calSamples++;
+        if (calSamples == CAL_SAMPLES) {
+            centerX = (int)(sumX / CAL_SAMPLES);
+            centerY = (int)(sumY / CAL_SAMPLES);
+        }
+        // During calibration, return zero so the stick doesn't drift.
+        return { 0, 0, 0, 0 };
+    }
+
+    float x = (x_raw - centerX) / 2048.0f;
+    float y = (y_raw - centerY) / 2048.0f;
 
     if (!upright) {
         float tx = x, ty = y;
