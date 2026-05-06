@@ -71,10 +71,11 @@ StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, Jo
     x = std::clamp(x, -1.0f, 1.0f);
     y = std::clamp(y, -1.0f, 1.0f);
 
-    // Hardware reports the Joy-Con 2 stick axes opposite of the on-screen
-    // upright orientation we expose to the app and virtual HID device.
-    int16_t outX = static_cast<int16_t>(-x * 32767);
-    int16_t outY = static_cast<int16_t>(y * 32767);
+    // Match joycon2cpp DecodeJoystick exactly: outX = +x * 32767, outY = -y * 32767.
+    // Our earlier negation of X produced a left/right mirror on the UI stick
+    // visualizer and any downstream HID consumer.
+    int16_t outX = static_cast<int16_t>(x * 32767);
+    int16_t outY = static_cast<int16_t>(-y * 32767);
 
     return { outX, outY, 0, 0 };
 }
