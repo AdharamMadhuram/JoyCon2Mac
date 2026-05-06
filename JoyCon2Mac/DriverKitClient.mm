@@ -28,16 +28,28 @@
 
 - (BOOL)start {
     if (_isRunning) return YES;
-    
-    CFMutableDictionaryRef matchingDict = IOServiceMatching("VirtualJoyConDriver");
+
+    // A DriverKit service's in-kernel IOClass is IOUserService — matching
+    // on that name would find every DEXT on the system. Instead we match
+    // on IOUserClass, which the kernel side copies verbatim from the DEXT's
+    // Info.plist personality. That narrows the lookup to exactly our
+    // VirtualJoyConDriver. (IOServiceMatching() on its own fills in
+    // "IOProviderClass", which we don't want here, so we build the dict
+    // manually.)
+    CFMutableDictionaryRef matchingDict =
+        CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+                                  &kCFTypeDictionaryKeyCallBacks,
+                                  &kCFTypeDictionaryValueCallBacks);
     if (!matchingDict) return NO;
-    
+    CFStringRef userClass = CFSTR("VirtualJoyConDriver");
+    CFDictionarySetValue(matchingDict, CFSTR("IOUserClass"), userClass);
+
     _service = IOServiceGetMatchingService(kIOMasterPortDefault, matchingDict);
     if (_service == IO_OBJECT_NULL) {
         NSLog(@"[DriverKitClient] ✗ VirtualJoyConDriver not found. Is the extension loaded?");
         return NO;
     }
-    
+
     kern_return_t ret = IOServiceOpen(_service, mach_task_self(), 0, &_connection);
     if (ret != KERN_SUCCESS) {
         NSLog(@"[DriverKitClient] ✗ Failed to open connection: 0x%x", ret);
@@ -45,7 +57,7 @@
         _service = IO_OBJECT_NULL;
         return NO;
     }
-    
+
     _isRunning = YES;
     NSLog(@"[DriverKitClient] ✓ Connected to VirtualJoyConDriver");
     return YES;

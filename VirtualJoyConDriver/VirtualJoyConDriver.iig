@@ -3,6 +3,7 @@
 
 #include <Availability.h>
 #include <HIDDriverKit/IOUserHIDDevice.iig>
+#include <DriverKit/IOService.iig>
 #include <DriverKit/IOUserClient.iig>
 
 // Struct for the basic JoyCon Report we will pass from user-space to kernel-space
@@ -30,7 +31,19 @@ struct JoyConNFCReportData {
     uint8_t payload[32]; // Max read size per chunk
 };
 
-class VirtualJoyConDriver : public IOUserHIDDevice
+// ---------------------------------------------------------------------------
+// Root IOService
+// ---------------------------------------------------------------------------
+//
+// Matches against IOUserResources (the DriverKit equivalent of IOResources in
+// the kernel) so it can load on any Mac without needing real hardware as a
+// provider. Does NOT publish an HID device by itself — its only job is to
+// hand out a VirtualJoyConUserClient, which in turn instantiates the HID
+// device dynamically via IOService::Create(). This is the Karabiner pattern
+// documented in their DriverKit-VirtualHIDDevice repo, the verified working
+// reference for virtual HID dexts on modern macOS. Content was rephrased
+// for compliance with licensing restrictions.
+class VirtualJoyConDriver : public IOService
 {
 public:
     virtual bool init() override;
@@ -39,6 +52,28 @@ public:
     virtual kern_return_t Start(IOService * provider) override;
     virtual kern_return_t Stop(IOService * provider) override;
     virtual kern_return_t NewUserClient(uint32_t type, IOUserClient ** userClient) override;
+};
+
+// ---------------------------------------------------------------------------
+// Virtual HID Device (created dynamically from the UserClient)
+// ---------------------------------------------------------------------------
+//
+// Subclasses IOUserHIDDevice and is instantiated when the daemon opens a
+// user client for the first time. The Info.plist declares its personality
+// under UserClientProperties > HIDDeviceProperties with IOClass =
+// AppleUserHIDDevice + IOUserClass = VirtualJoyConHIDDevice, which is what
+// the kernel looks for when the root calls Create(this, "HIDDeviceProperties",
+// ...). From here on it behaves like a real HID device, announcing the
+// composite (gamepad + mouse + vendor-defined) report descriptor and
+// dispatching reports via handleReport().
+class VirtualJoyConHIDDevice : public IOUserHIDDevice
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
 
     virtual OSDictionary * newDeviceDescription() override;
     virtual OSData * newReportDescriptor() override;
@@ -46,12 +81,15 @@ public:
     virtual kern_return_t setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
     virtual kern_return_t getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
 
-    // Custom methods meant to be called from the daemon user-client
+    // Called from the UserClient when new report data arrives from the daemon.
     kern_return_t dispatchGamepadReport(JoyConReportData reportData) LOCALONLY;
     kern_return_t dispatchMouseReport(JoyConMouseReportData reportData) LOCALONLY;
     kern_return_t dispatchNFCReport(JoyConNFCReportData reportData) LOCALONLY;
 };
 
+// ---------------------------------------------------------------------------
+// User client
+// ---------------------------------------------------------------------------
 class VirtualJoyConUserClient : public IOUserClient
 {
 public:
