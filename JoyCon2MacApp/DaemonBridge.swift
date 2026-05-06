@@ -325,19 +325,10 @@ class DaemonBridge: ObservableObject {
             // mirrors to ~/Library/Application Support/JoyCon2Mac/input-trace.log
             // so you can just `tail -f` that file while playing. To turn it
             // off: edit the daemon args below and add "--no-debug-input".
-            //
-            // --right-stick-alt enables the candidate right-stick decode from
-            // the primary-stick packet offset (buffer[10..12]) instead of the
-            // Pro-Controller offset (buffer[13..15]). Enabled here because
-            // the [BLE->DEC R] trace showed that [13..15] carried mouse/IR
-            // telemetry rather than stick values, producing huge Y bias and
-            // swapped X/Y symptoms in games. If the alt decode is wrong we
-            // remove this arg and revert the flag default.
             configuration.arguments = [
                 "--json",
                 "--json-file", logPath.path,
-                "--control-file", controlPath.path,
-                "--right-stick-alt"
+                "--control-file", controlPath.path
             ]
 
             isDaemonRunning = true
