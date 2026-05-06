@@ -145,16 +145,22 @@
     //   2. When the user *does* turn mouse mode on, we want the hysteresis
     //      counters to already be accurate so the very first packet picks
     //      the right side instead of taking ~120 ms to catch up.
+    //
+    // Byte 0x17 (MouseData.distance) semantic, confirmed on hardware:
+    //   distance == 0  → Joy-Con is TOUCHING a surface (distance is zero)
+    //   distance >  0  → Joy-Con is airborne, typical value ~12
+    // `airFrames*` is "how many consecutive packets have shown this side
+    // in the air", so it increments when distance > 0 and resets on 0.
     if (side == JoyConSide::Left) {
         _lastDistanceLeft = mouseDistance;
-        if (mouseDistance == 0) {
+        if (mouseDistance > 0) {
             if (_airFramesLeft < 255) _airFramesLeft += 1;
         } else {
             _airFramesLeft = 0;
         }
     } else {
         _lastDistanceRight = mouseDistance;
-        if (mouseDistance == 0) {
+        if (mouseDistance > 0) {
             if (_airFramesRight < 255) _airFramesRight += 1;
         } else {
             _airFramesRight = 0;
@@ -165,36 +171,31 @@
     // regardless of the mouse emitter's on/off state. With manual Left /
     // Right, lastActiveSide is already pinned by setSource.
     if (_source == MouseSourceAuto) {
-        // Whichever side is currently on a surface (airFrames==0 AND
-        // distance>0) owns the pointer. If both are on a surface, prefer
-        // the one we were already using — stickiness kills the per-packet
-        // ping-pong. If neither is on a surface, leave lastActiveSide alone.
-        BOOL leftOn  = (_lastDistanceLeft  > 0) && (_airFramesLeft  == 0);
-        BOOL rightOn = (_lastDistanceRight > 0) && (_airFramesRight == 0);
+        // A side is "on surface" iff its last distance reading is 0 AND
+        // it hasn't just been airborne for a single blip frame. We adopt
+        // whichever side is on the surface exclusively; if both are on
+        // or neither is, we keep the current choice (stickiness kills
+        // the per-packet ping-pong).
+        BOOL leftOn  = (_lastDistanceLeft  == 0) && (_airFramesLeft  == 0);
+        BOOL rightOn = (_lastDistanceRight == 0) && (_airFramesRight == 0);
 
         if (leftOn && !rightOn) {
             _lastActiveSide = JoyConSide::Left;
         } else if (rightOn && !leftOn) {
             _lastActiveSide = JoyConSide::Right;
         } else if (leftOn && rightOn) {
-            // Both on surface — keep current choice. But if the current
-            // active side has been airborne for HYST packets, we would have
-            // already handed over on a previous packet, so reaching here
-            // means the active side is still healthy.
-            // (no-op)
+            // Both on surface — keep current choice to avoid ping-pong.
         } else {
             // Neither on a surface. Only hand over once the active side
             // has clearly been lifted for a sustained window, to avoid
-            // snap-backs when the sensor blips between d=0 and d=1.
+            // snap-backs when the sensor blips. Actual handover happens
+            // in the leftOn/rightOn branches above when the next
+            // on-surface packet arrives.
             static const uint8_t AIR_HYST = 8; // ~120 ms at 66 Hz
             BOOL activeIsLeft = (_lastActiveSide == JoyConSide::Left);
             uint8_t activeAir = activeIsLeft ? _airFramesLeft  : _airFramesRight;
-            if (activeAir >= AIR_HYST) {
-                // Active side has clearly been lifted. Leave lastActiveSide
-                // where it is — we only switch when the OTHER side lands.
-                // That happens in the leftOn/rightOn branches above when the
-                // next on-surface packet arrives.
-            }
+            (void)activeAir;
+            (void)AIR_HYST;
         }
     }
 
