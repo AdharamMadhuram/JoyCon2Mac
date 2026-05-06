@@ -635,43 +635,46 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         report.triggerL = g_state.triggerL;
         report.triggerR = g_state.triggerR;
 
-        [g_driverClient postGamepadReport:report];
+        // Only send a new HID report when something actually changed.
+        // Without this gate we fire ~132 reports/sec (66 Hz per side),
+        // and some games interpret each report-with-button-set as a new
+        // press event rather than a held state — causing R1/ZR/face
+        // buttons to appear to fire repeatedly while held.
+        static JoyConReportData lastSentReport = {};
+        static bool firstReport = true;
+        bool reportChanged = firstReport
+            || report.buttons  != lastSentReport.buttons
+            || report.dpad     != lastSentReport.dpad
+            || report.stickLX  != lastSentReport.stickLX
+            || report.stickLY  != lastSentReport.stickLY
+            || report.stickRX  != lastSentReport.stickRX
+            || report.stickRY  != lastSentReport.stickRY
+            || report.triggerL != lastSentReport.triggerL
+            || report.triggerR != lastSentReport.triggerR;
 
-        // [HID-TX] Change-triggered trace of exactly what leaves the daemon
-        // for the dext. Prints the 18-bit button word in hex so bits 12..15
-        // (D-pad in the W3C standard mapping) are directly readable, the
-        // hat nibble, all four stick axes, and both analog trigger bytes.
-        // Combined with [BLE->DEC L/R] this tells us whether a missing
-        // input is lost in the decoder, the mapping, or the driver hop.
-        if (g_debugInput) {
-            static uint32_t lastBtn = ~0u;
-            static uint8_t  lastDpad = 0xFF;
-            static int16_t  lastLX = INT16_MIN, lastLY = INT16_MIN;
-            static int16_t  lastRX = INT16_MIN, lastRY = INT16_MIN;
-            static uint8_t  lastTL = 0xFF, lastTR = 0xFF;
-            if (report.buttons != lastBtn || report.dpad != lastDpad
-                || report.stickLX != lastLX || report.stickLY != lastLY
-                || report.stickRX != lastRX || report.stickRY != lastRY
-                || report.triggerL != lastTL || report.triggerR != lastTR) {
-                bool bU = report.buttons & (1u << 12);
-                bool bD = report.buttons & (1u << 13);
-                bool bL = report.buttons & (1u << 14);
-                bool bR = report.buttons & (1u << 15);
-                debugInputLog(
-                        "[HID-TX] btn=0x%05x dpadBits=%c%c%c%c hat=%u "
-                        "LS=(%6d,%6d) RS=(%6d,%6d) T=(%3u,%3u)\n",
-                        report.buttons,
-                        bU ? 'U' : '.', bD ? 'D' : '.', bL ? 'L' : '.', bR ? 'R' : '.',
-                        (unsigned)report.dpad,
-                        report.stickLX, report.stickLY,
-                        report.stickRX, report.stickRY,
-                        (unsigned)report.triggerL, (unsigned)report.triggerR);
-                lastBtn = report.buttons;
-                lastDpad = report.dpad;
-                lastLX = report.stickLX; lastLY = report.stickLY;
-                lastRX = report.stickRX; lastRY = report.stickRY;
-                lastTL = report.triggerL; lastTR = report.triggerR;
-            }
+        if (reportChanged) {
+            lastSentReport = report;
+            firstReport = false;
+            [g_driverClient postGamepadReport:report];
+        }
+
+        // [HID-TX] Fires only when we actually sent a new report (same
+        // gate as the dedup check above). Shows the full button word,
+        // hat, axes, and triggers so you can verify the whole pipeline.
+        if (g_debugInput && reportChanged) {
+            bool bU = report.buttons & (1u << 12);
+            bool bD = report.buttons & (1u << 13);
+            bool bL = report.buttons & (1u << 14);
+            bool bR = report.buttons & (1u << 15);
+            debugInputLog(
+                    "[HID-TX] btn=0x%05x dpadBits=%c%c%c%c hat=%u "
+                    "LS=(%6d,%6d) RS=(%6d,%6d) T=(%3u,%3u)\n",
+                    report.buttons,
+                    bU ? 'U' : '.', bD ? 'D' : '.', bL ? 'L' : '.', bR ? 'R' : '.',
+                    (unsigned)report.dpad,
+                    report.stickLX, report.stickLY,
+                    report.stickRX, report.stickRY,
+                    (unsigned)report.triggerL, (unsigned)report.triggerR);
         }
     }
     
