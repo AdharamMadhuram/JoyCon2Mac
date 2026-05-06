@@ -334,7 +334,9 @@ OSDictionary * VirtualJoyConGamepadDevice::newDeviceDescription() {
     OSNumber * vendor       = OSNumber::withNumber(static_cast<uint32_t>(0x057E), 32); // Nintendo
     OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x2066), 32); // Joy-Con 2 pair (custom)
     OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
-    OSString * transport    = OSString::withCString("Virtual");
+    // "Bluetooth" instead of "Virtual" so Chrome's Gamepad API doesn't
+    // filter us out. Chrome on macOS skips Transport=Virtual devices.
+    OSString * transport    = OSString::withCString("Bluetooth");
     OSString * manufacturer = OSString::withCString("JoyCon2Mac");
     OSString * productName  = OSString::withCString("Joy-Con 2 Gamepad (Virtual)");
 
