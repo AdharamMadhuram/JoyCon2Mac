@@ -423,7 +423,7 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         << "\"accelZ\":" << sideMotion.accelZ << ","
         << "\"mouseX\":" << sideMouse.deltaX << ","
         << "\"mouseY\":" << sideMouse.deltaY << ","
-        << "\"mouseDistance\":" << sideMouse.distance << ","
+        << "\"surfaceDistance\":" << sideMouse.distance << ","
         << "\"batteryVoltage\":" << g_state.battery.voltage << ","
         << "\"batteryCurrent\":" << g_state.battery.current << ","
         << "\"batteryTemperature\":" << g_state.battery.temperature << ","
@@ -512,7 +512,7 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
                                                  side:side
                                           buttonState:sideButtons
                                          stickReading:sideStick
-                                        mouseDistance:sideDistance];
+                                        surfaceDistance:sideDistance];
         if (consumed) {
             // Only the gamepad-path values get the stripped data.
             sideButtonsForGamepad = ExtractButtonState(workingBuffer, side);

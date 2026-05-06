@@ -41,7 +41,7 @@ typedef NS_ENUM(NSInteger, MouseSource) {
 
 // Feed a fresh Joy-Con input buffer. Replaces the Right-only method. The
 // emitter decides whether this packet is from the active side (using
-// `source` + auto detection based on mouseDistance) and only then runs the
+// `source` + auto detection based on surfaceDistance) and only then runs the
 // mouse logic on it. If consumed, `buffer` is mutated to clear the HID bits
 // the mouse used so the virtual gamepad doesn't see them either, mirroring
 // joycon2cpp/testapp/src/testapp.cpp's suppression step.
@@ -54,7 +54,7 @@ typedef NS_ENUM(NSInteger, MouseSource) {
                  side:(JoyConSide)side
           buttonState:(uint32_t)btnState
          stickReading:(StickData)stickData
-        mouseDistance:(uint16_t)mouseDistance;
+        surfaceDistance:(uint16_t)surfaceDistance;
 
 @end
 

@@ -1,33 +1,31 @@
 import SwiftUI
 
-// ─── Joy-Con IMU axis convention ─────────────────────────────────────────
+// ─── Joy-Con 2 IMU axis convention ───────────────────────────────────────
 //
-// Canonical (Left Joy-Con / Pro Controller) body frame — matches the Linux
-// `hid-nintendo` driver (joycon_parse_imu_report, confirmed against
-// dekuNukem's reverse-engineering notes):
+// The joycon2cpp reference (our known-good Switch 2 implementation) reads
+// both Joy-Cons' accel/gyro as raw int16 at the same packet offsets and
+// pipes them straight into a DS4 report without any per-side sign flip:
 //
-//   +X  points toward the triggers        (up the long axis)
-//   +Y  points to the left
-//   +Z  points up, out of the buttons/sticks face
+//   accel X/Y/Z  at 0x30 / 0x32 / 0x34   (scale: 4096 = 1 G)
+//   gyro  X/Y/Z  at 0x36 / 0x38 / 0x3A   (scale: 48000 = 360 °/s)
 //
-// It's a right-handed frame.
+// (Source: joycon2cpp/README.md + testapp GenerateDS4Report / GenerateDual-
+// JoyConDS4Report, which memcpys wAccelX..wGyroZ one-to-one. Content was
+// rephrased for compliance with licensing restrictions.)
 //
-// The Right Joy-Con's IMU is physically mounted flipped, so its raw Y and Z
-// readings are negated relative to the canonical frame. Before fusing with
-// the left JC, we apply:   (x, y, z)_canon = (x, -y, -z)_raw_right
-// for BOTH accel and gyro.
+// The Linux `hid-nintendo` driver DOES negate Y and Z on the original
+// Joy-Con (v1) right controller because its IMU chip is physically
+// rotated 180° relative to the left. I initially copied that flip here,
+// but joycon2cpp (the Switch 2 reference) does not apply it, which
+// suggests the Joy-Con 2 IMU mounting differs. We expose both options
+// via `invertRightAxes` so the user can verify on real hardware: flat
+// on desk, face up → both sides should read accel ≈ (0, 0, +1 G). If
+// the right reads (0, 0, -1 G), flip the toggle.
 //
-// Gravity at rest (controller flat, buttons up):  accel = (0, 0, +1 G).
-// Pitch (around Y):  atan2(-ax, sqrt(ay² + az²))
-// Roll  (around X):  atan2( ay, az)
-// Yaw   (around Z):  pure gyro integration, drifts (no magnetometer).
-//
-// References:
-//   - github.com/nicman23/dkms-hid-nintendo  joycon_parse_imu_report (axis
-//     negation for right Joy-Con is documented inline in that file)
-//   - github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering
-//     imu_sensor_notes.md
-//   Content was rephrased for compliance with licensing restrictions.
+// Gravity frame math (once both sides share a convention):
+//   pitch = atan2(-ax, sqrt(ay² + az²))   (around Y)
+//   roll  = atan2( ay, az)                (around X)
+//   yaw   = ∫ gz dt                        (around Z, drifts — no mag.)
 
 import simd
 
@@ -45,6 +43,12 @@ struct GyroView: View {
     @EnvironmentObject var daemonBridge: DaemonBridge
     @State private var showRawValues = false
     @State private var gyroSource: GyroSource = .fused
+    // Defaults to OFF because joycon2cpp's known-good Switch 2 path does
+    // not negate any right-side axes. Flip this if the right Joy-Con's
+    // gravity vector points opposite the left when both are flat on the
+    // desk — that means the IMU is physically mounted 180° like the
+    // original v1 Joy-Con.
+    @State private var invertRightAxes: Bool = false
 
     private var leftController: ControllerState? {
         daemonBridge.controllers.first { $0.side == "left" }
@@ -65,9 +69,15 @@ struct GyroView: View {
     }
     private var canonicalRight: IMUSample? {
         guard let c = rightController, c.isConnected else { return nil }
-        // Right Joy-Con has Y and Z negated vs canonical.
-        return IMUSample(accel: SIMD3(c.accelX, -c.accelY, -c.accelZ),
-                         gyro:  SIMD3(c.gyroX,  -c.gyroY,  -c.gyroZ))
+        // joycon2cpp passes raw int16s straight through for both sides, so
+        // the default here is "no flip". Enable invertRightAxes if you see
+        // the right stick tilt opposite the left when both are held the
+        // same way — that would mean the IMU is mounted flipped on this
+        // hardware revision.
+        let sy: Double = invertRightAxes ? -1 : 1
+        let sz: Double = invertRightAxes ? -1 : 1
+        return IMUSample(accel: SIMD3(c.accelX, sy * c.accelY, sz * c.accelZ),
+                         gyro:  SIMD3(c.gyroX,  sy * c.gyroY,  sz * c.gyroZ))
     }
 
     // Sample that actually drives the filter, depending on the picker.
@@ -113,11 +123,13 @@ struct GyroView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(alignment: .center, spacing: 16) {
             Text("Motion Sensors")
                 .font(.title)
                 .fontWeight(.bold)
             Spacer()
+            Toggle("Invert Right Axes", isOn: $invertRightAxes)
+                .help("Flip the right Joy-Con's Y and Z axes. Only enable if the right side tilts opposite the left when both are held the same way.")
             Toggle("Show Raw Values", isOn: $showRawValues)
         }
     }
@@ -159,10 +171,14 @@ struct GyroView: View {
                 Text("Gyroscope (°/s) — \(gyroSource.rawValue)")
                     .font(.headline)
                 HStack(spacing: 28) {
-                    MotionBar(label: "Pitch (X)",
+                    // Rate labels match which Euler angle the axis drives:
+                    //   gyroX is angular velocity about body +X → Roll rate
+                    //   gyroY is angular velocity about body +Y → Pitch rate
+                    //   gyroZ is angular velocity about body +Z → Yaw rate
+                    MotionBar(label: "Roll (X)",
                               value: fusedSample?.gyro.x ?? 0,
                               range: -720...720, color: .red)
-                    MotionBar(label: "Roll (Y)",
+                    MotionBar(label: "Pitch (Y)",
                               value: fusedSample?.gyro.y ?? 0,
                               range: -720...720, color: .green)
                     MotionBar(label: "Yaw (Z)",
@@ -188,12 +204,17 @@ struct GyroView: View {
 
     private var rawValuesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Raw Values (raw = straight from decoder; canonical = right-JC axes flipped)")
+            Text(invertRightAxes
+                 ? "Raw values (right-side Y,Z shown both raw and after the invertRightAxes flip)"
+                 : "Raw values (right-side passed through as joycon2cpp does — no flip)")
                 .font(.headline)
 
-            rawRow(label: "Left (raw = canonical)", c: leftController)
-            rawRow(label: "Right (raw)", c: rightController, canonicalize: false)
-            rawRow(label: "Right (canonical)", c: rightController, canonicalize: true)
+            rawRow(label: "Left", c: leftController)
+            rawRow(label: invertRightAxes ? "Right (raw)" : "Right",
+                   c: rightController, canonicalize: false)
+            if invertRightAxes {
+                rawRow(label: "Right (after Y,Z flip)", c: rightController, canonicalize: true)
+            }
         }
     }
 
@@ -321,9 +342,15 @@ private final class OrientationFilter: ObservableObject {
         let gy = abs(sample.gyro.y) < gyroDeadband ? 0 : sample.gyro.y
         let gz = abs(sample.gyro.z) < gyroDeadband ? 0 : sample.gyro.z
 
-        // Short-term orientation: integrate gyro rates.
-        let gyroPitch = pitch + gx * dt
-        let gyroRoll  = roll  + gy * dt
+        // Integrate gyro rates into the Euler angles they correspond to.
+        // Pitch is rotation about body +Y, so its rate is gyroY.
+        // Roll  is rotation about body +X, so its rate is gyroX.
+        // Yaw   is rotation about body +Z, so its rate is gyroZ.
+        // Earlier revisions swapped X and Y here — pitch was integrating
+        // gyroX and roll was integrating gyroY, which is why tilting the
+        // Joy-Con forward made the model roll and vice versa.
+        let gyroPitch = pitch + gy * dt
+        let gyroRoll  = roll  + gx * dt
         let gyroYaw   = yaw   + gz * dt
 
         // Long-term pitch/roll: derive from gravity. Skip if the controller
