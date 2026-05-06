@@ -34,21 +34,28 @@ struct ControllerState: Identifiable {
     var triggerR: UInt8
     var packetCount: UInt32
     var mouseMode: MouseMode
+    var mouseSource: MouseSource
+    var mouseActiveSide: String
     var rssi: Int
 }
 
 enum MouseMode: Int {
+    // Raw values MUST match the daemon's C++ MouseMode enum in MouseEmitter.h:
+    //   0 = OFF, 1 = FAST, 2 = NORMAL, 3 = SLOW
+    // Before this alignment the picker silently sent the wrong numeric code
+    // (Swift had slow=1 where the daemon wanted fast=1) so picking "Slow"
+    // actually enabled "Fast" on the daemon side.
     case off = 0
-    case slow = 1
+    case fast = 1
     case normal = 2
-    case fast = 3
+    case slow = 3
 
     var description: String {
         switch self {
         case .off: return "Off"
-        case .slow: return "Slow"
-        case .normal: return "Normal"
         case .fast: return "Fast"
+        case .normal: return "Normal"
+        case .slow: return "Slow"
         }
     }
 
@@ -57,7 +64,22 @@ enum MouseMode: Int {
         case .off: return 0.0
         case .slow: return 0.3
         case .normal: return 0.6
-        case .fast: return 1.2
+        case .fast: return 1.0
+        }
+    }
+}
+
+enum MouseSource: Int {
+    // Raw values match the daemon's C++ MouseSource enum.
+    case auto = 0
+    case left = 1
+    case right = 2
+
+    var description: String {
+        switch self {
+        case .auto: return "Auto"
+        case .left: return "Left Joy-Con"
+        case .right: return "Right Joy-Con"
         }
     }
 }
@@ -592,6 +614,8 @@ class DaemonBridge: ObservableObject {
             triggerR: uint8Value(object["triggerR"]),
             packetCount: uint32Value(object["packetCount"]),
             mouseMode: MouseMode(rawValue: intValue(object["mouseMode"])) ?? .off,
+            mouseSource: MouseSource(rawValue: intValue(object["mouseSource"])) ?? .auto,
+            mouseActiveSide: stringValue(object["mouseActiveSide"], default: "right"),
             rssi: intValue(object["rssi"], default: 0)
         )
     }
@@ -690,7 +714,9 @@ class DaemonBridge: ObservableObject {
                         accelX: 0, accelY: 0, accelZ: 0,
                         mouseX: 0, mouseY: 0, mouseDistance: 0,
                         triggerL: 0, triggerR: 0,
-                        packetCount: 0, mouseMode: .off, rssi: 0
+                        packetCount: 0, mouseMode: .off,
+                        mouseSource: .auto, mouseActiveSide: "right",
+                        rssi: 0
                     )
                 )
                 updated.sort { $0.id < $1.id }
@@ -745,6 +771,18 @@ class DaemonBridge: ObservableObject {
         if !controllers.isEmpty {
             var updated = controllers
             updated[0].mouseMode = mode
+            controllers = updated
+            stateRevision &+= 1
+        }
+    }
+
+    func setMouseSource(_ source: MouseSource) {
+        sendControlCommand(["cmd": "setMouseSource", "value": source.rawValue])
+        if !controllers.isEmpty {
+            var updated = controllers
+            for index in updated.indices {
+                updated[index].mouseSource = source
+            }
             controllers = updated
             stateRevision &+= 1
         }

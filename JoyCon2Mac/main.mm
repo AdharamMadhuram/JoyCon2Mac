@@ -22,6 +22,14 @@ struct ControllerState {
     // whichever controller pushed the most recent BLE notification.
     MotionData motionLeft  = {0, 0, 0, 0, 0, 0};
     MotionData motionRight = {0, 0, 0, 0, 0, 0};
+    // Mouse telemetry per side. Both Joy-Con 2 halves carry the optical
+    // sensor at the same packet offsets (0x10..0x13 for XY delta, 0x17 for
+    // surface distance). Keeping a separate record per side lets the UI
+    // show which controller is on a surface and lets the Auto source
+    // picker flip based on which one has distance != 0.
+    MouseData mouseLeft  = {0, 0, 0};
+    MouseData mouseRight = {0, 0, 0};
+    // Single "mouse" field preserved for the legacy printDetailedState().
     MouseData mouse = {0, 0, 0};
     BatteryData battery = {0, 0, 0, -1};
     uint8_t triggerL = 0;
@@ -183,6 +191,28 @@ static void applyControlCommand(NSDictionary *command) {
         std::cout << "[Control] Mouse mode set to " << modeName << std::endl;
     } else if ([cmd isEqualToString:@"toggleMouseMode"]) {
         toggleMouseMode();
+    } else if ([cmd isEqualToString:@"setMouseSource"]) {
+        if (!g_mouseEmitter) return;
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        int raw = value.intValue;
+        if (raw < 0 || raw > 2) return;
+        MouseSource target = (MouseSource)raw;
+        if (g_mouseEmitter.source == target) {
+            emitDaemonEvent("mouseSource",
+                            [[NSString stringWithFormat:@"already=%d", raw] UTF8String]);
+            return;
+        }
+        g_mouseEmitter.source = target;
+        const char *srcName = "AUTO";
+        switch (target) {
+            case MouseSourceLeft:  srcName = "LEFT";  break;
+            case MouseSourceRight: srcName = "RIGHT"; break;
+            default: break;
+        }
+        emitDaemonEvent("mouseSource",
+                        [[NSString stringWithFormat:@"applied=%s (%d)", srcName, raw] UTF8String]);
+        std::cout << "[Control] Mouse source set to " << srcName << std::endl;
     } else {
         emitDaemonEvent("controlUnknown",
                         [[NSString stringWithFormat:@"unknown cmd=%@", cmd] UTF8String]);
@@ -365,7 +395,10 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
     // the same gyro/accel trio for both controllers, which is the "wonky 3D
     // cube that doesn't match the physical Joy-Con" symptom.
     const MotionData &sideMotion = side == JoyConSide::Right ? g_state.motionRight : g_state.motionLeft;
+    const MouseData &sideMouse = side == JoyConSide::Right ? g_state.mouseRight : g_state.mouseLeft;
     int mouseMode = g_mouseEmitter ? (int)g_mouseEmitter.currentMode : 0;
+    int mouseSource = g_mouseEmitter ? (int)g_mouseEmitter.source : 0;
+    const char *mouseActive = g_mouseEmitter && g_mouseEmitter.lastActiveSide == JoyConSide::Left ? "left" : "right";
 
     std::ostringstream out;
     out << "{"
@@ -388,16 +421,18 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
         << "\"accelX\":" << sideMotion.accelX << ","
         << "\"accelY\":" << sideMotion.accelY << ","
         << "\"accelZ\":" << sideMotion.accelZ << ","
-        << "\"mouseX\":" << g_state.mouse.deltaX << ","
-        << "\"mouseY\":" << g_state.mouse.deltaY << ","
-        << "\"mouseDistance\":" << g_state.mouse.distance << ","
+        << "\"mouseX\":" << sideMouse.deltaX << ","
+        << "\"mouseY\":" << sideMouse.deltaY << ","
+        << "\"mouseDistance\":" << sideMouse.distance << ","
         << "\"batteryVoltage\":" << g_state.battery.voltage << ","
         << "\"batteryCurrent\":" << g_state.battery.current << ","
         << "\"batteryTemperature\":" << g_state.battery.temperature << ","
         << "\"batteryPercentage\":" << g_state.battery.percentage << ","
         << "\"triggerL\":" << (int)g_state.triggerL << ","
         << "\"triggerR\":" << (int)g_state.triggerR << ","
-        << "\"mouseMode\":" << mouseMode
+        << "\"mouseMode\":" << mouseMode << ","
+        << "\"mouseSource\":" << mouseSource << ","
+        << "\"mouseActiveSide\":\"" << mouseActive << "\""
         << "}";
     emitJSONLine(out.str());
 }
@@ -422,10 +457,13 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     // into the right controller's telemetry row and vice versa.
     if (side == JoyConSide::Left) {
         g_state.motionLeft = DecodeMotion(buffer, side);
+        g_state.mouseLeft  = DecodeMouse(buffer);
+        g_state.mouse      = g_state.mouseLeft;
     } else {
         g_state.motionRight = DecodeMotion(buffer, side);
+        g_state.mouseRight  = DecodeMouse(buffer);
+        g_state.mouse       = g_state.mouseRight;
     }
-    g_state.mouse = DecodeMouse(buffer);
     g_state.battery = DecodeBattery(buffer);
     auto triggers = DecodeAnalogTriggers(buffer);
     g_state.triggerL = triggers.first;
@@ -443,43 +481,78 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         wasChatPressed = chatPressed;
     }
 
-    // Mouse mode runs only for Right Joy-Con packets, matching the single-
-    // Joy-Con branch of joycon2cpp/testapp/src/testapp.cpp. For Left we
-    // skip straight to the gamepad report.
+    // Mouse mode: feed the raw packet to the emitter so it can decide
+    // (based on its `source` setting + per-side distance) whether to
+    // consume this packet as a mouse event.
+    //
+    // IMPORTANT: the emitter mutates `workingBuffer` to suppress the
+    // HID bits it consumed. We want those suppressions to land on the
+    // gamepad report ONLY — the UI JSON must still report the real
+    // button state so the on-screen gamepad visualisation works. So we
+    // build two derived button/stick values:
+    //
+    //   sideButtonsForGamepad / sideStickForGamepad → fed to DS4/HID
+    //   g_state.rightButtons / g_state.rightStick   → untouched, UI sees them
     std::vector<uint8_t> workingBuffer = buffer;
-    if (side == JoyConSide::Right &&
-        g_mouseEmitter &&
-        g_mouseEmitter.currentMode != MouseModeOff) {
-        StickData rStick = g_state.rightStick;
-        [g_mouseEmitter processRightJoyConBuffer:workingBuffer
-                                     buttonState:sideButtons
-                                    stickReading:rStick];
-        // processRightJoyConBuffer zeroed the HID bits it consumed. Re-decode
-        // the gamepad-relevant fields from the modified buffer so the virtual
-        // gamepad doesn't also see the mouse-mode presses.
-        sideButtons       = ExtractButtonState(workingBuffer, JoyConSide::Right);
-        g_state.rightButtons = sideButtons;
-        g_state.rightStick   = DecodeJoystick(workingBuffer, JoyConSide::Right, JoyConOrientation::Upright);
-        g_state.buttons      = sideButtons;
+    uint32_t sideButtonsForGamepad = sideButtons;
+    StickData sideStickForGamepad  = (side == JoyConSide::Right)
+                                        ? g_state.rightStick
+                                        : g_state.leftStick;
+
+    if (g_mouseEmitter && g_mouseEmitter.currentMode != MouseModeOff) {
+        StickData sideStick = sideStickForGamepad;
+        uint16_t sideDistance = (side == JoyConSide::Right)
+                                  ? g_state.mouseRight.distance
+                                  : g_state.mouseLeft.distance;
+        BOOL consumed = [g_mouseEmitter processBuffer:workingBuffer
+                                                 side:side
+                                          buttonState:sideButtons
+                                         stickReading:sideStick
+                                        mouseDistance:sideDistance];
+        if (consumed) {
+            // Only the gamepad-path values get the stripped data.
+            sideButtonsForGamepad = ExtractButtonState(workingBuffer, side);
+            sideStickForGamepad   = DecodeJoystick(workingBuffer, side, JoyConOrientation::Upright);
+        }
     }
 
     if (g_enableGamepad && g_driverClient) {
-        // Send Gamepad Report
-        bool up = g_state.leftButtons & 0x0002;
-        bool down = g_state.leftButtons & 0x0001;
-        bool left = g_state.leftButtons & 0x0008;
-        bool right = g_state.leftButtons & 0x0004;
+        // Build the DS4/HID report using the STRIPPED side buttons/stick
+        // so the virtual gamepad doesn't also see the mouse clicks and
+        // cursor-drive stick tilts. The UI/telemetry path below still
+        // uses g_state.{left,right}Buttons which are the real values.
+        uint32_t leftButtonsForReport  = g_state.leftButtons;
+        uint32_t rightButtonsForReport = g_state.rightButtons;
+        StickData leftStickForReport   = g_state.leftStick;
+        StickData rightStickForReport  = g_state.rightStick;
+        if (side == JoyConSide::Left) {
+            leftButtonsForReport = sideButtonsForGamepad;
+            leftStickForReport   = sideStickForGamepad;
+        } else {
+            rightButtonsForReport = sideButtonsForGamepad;
+            rightStickForReport   = sideStickForGamepad;
+        }
+
+        bool up    = leftButtonsForReport & 0x0002;
+        bool down  = leftButtonsForReport & 0x0001;
+        bool left  = leftButtonsForReport & 0x0008;
+        bool right = leftButtonsForReport & 0x0004;
 
         struct JoyConReportData report;
-        report.buttons = [DriverKitClient convertButtonsToHID:g_state.leftButtons rightButtons:g_state.rightButtons dpadUp:up dpadDown:down dpadLeft:left dpadRight:right];
+        report.buttons = [DriverKitClient convertButtonsToHID:leftButtonsForReport
+                                                 rightButtons:rightButtonsForReport
+                                                       dpadUp:up
+                                                     dpadDown:down
+                                                     dpadLeft:left
+                                                    dpadRight:right];
         report.dpad = makeHIDDpad(up, down, left, right);
-        report.stickLX = g_state.leftStick.x;
-        report.stickLY = -g_state.leftStick.y;
-        report.stickRX = g_state.rightStick.x;
-        report.stickRY = -g_state.rightStick.y;
+        report.stickLX = leftStickForReport.x;
+        report.stickLY = -leftStickForReport.y;
+        report.stickRX = rightStickForReport.x;
+        report.stickRY = -rightStickForReport.y;
         report.triggerL = g_state.triggerL;
         report.triggerR = g_state.triggerR;
-        
+
         [g_driverClient postGamepadReport:report];
     }
     

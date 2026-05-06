@@ -15,36 +15,46 @@ typedef NS_ENUM(NSInteger, MouseMode) {
     MouseModeSlow   = 3
 };
 
+// Which Joy-Con drives the mouse. joycon2cpp only implements Right, but the
+// Joy-Con 2 (L) also carries an optical sensor and reports distance at the
+// same packet offset. Auto picks whichever side is currently reading a
+// non-zero distance (i.e. the one resting on a surface), falling back to the
+// last-active side if both are on surfaces and to Right if nothing is
+// readable yet.
+typedef NS_ENUM(NSInteger, MouseSource) {
+    MouseSourceAuto  = 0,
+    MouseSourceLeft  = 1,
+    MouseSourceRight = 2
+};
+
 @interface MouseEmitter : NSObject
 
 @property (nonatomic, assign) MouseMode currentMode;
+@property (nonatomic, assign) MouseSource source;
 @property (nonatomic, assign) DriverKitClient *driverClient;
 
-// Raw optical history (joycon2cpp: lastOpticalX / lastOpticalY / firstOpticalRead).
-@property (nonatomic, assign) BOOL firstOpticalRead;
-@property (nonatomic, assign) int16_t lastOpticalX;
-@property (nonatomic, assign) int16_t lastOpticalY;
-
-// Scroll accumulator (joycon2cpp: scrollAccumulator, 120 units per wheel click).
-@property (nonatomic, assign) float scrollAccumulator;
-
-// Button edge-detect state (joycon2cpp: leftBtnPressed / rightBtnPressed /
-// middleBtnPressed / mb4Pressed / mb5Pressed).
-@property (nonatomic, assign) BOOL leftBtnPressed;
-@property (nonatomic, assign) BOOL rightBtnPressed;
-@property (nonatomic, assign) BOOL middleBtnPressed;
-@property (nonatomic, assign) BOOL mb4Pressed;
-@property (nonatomic, assign) BOOL mb5Pressed;
+// The side the last optical sample was actually consumed from. Exposed so
+// main.mm can emit it as telemetry (the GUI shows "Active: Left/Right").
+@property (nonatomic, readonly, assign) JoyConSide lastActiveSide;
 
 - (instancetype)initWithDriverClient:(DriverKitClient *)client;
 
-// Feed a fresh Right Joy-Con input buffer. Mirrors the inline ValueChanged
-// handler in joycon2cpp/testapp/src/testapp.cpp (single-Joy-Con branch,
-// mouse-mode section). buffer may be mutated — we clear the HID bits that
-// the mouse consumed so they don't also fire the gamepad report.
-- (void)processRightJoyConBuffer:(std::vector<uint8_t> &)buffer
-                     buttonState:(uint32_t)btnState
-                    stickReading:(StickData)stickData;
+// Feed a fresh Joy-Con input buffer. Replaces the Right-only method. The
+// emitter decides whether this packet is from the active side (using
+// `source` + auto detection based on mouseDistance) and only then runs the
+// mouse logic on it. If consumed, `buffer` is mutated to clear the HID bits
+// the mouse used so the virtual gamepad doesn't see them either, mirroring
+// joycon2cpp/testapp/src/testapp.cpp's suppression step.
+//
+// Returns YES if this packet was consumed as mouse input (so callers can
+// re-decode buttons/stick from the stripped buffer before handing it to the
+// DS4/HID report path). Returns NO otherwise — use the untouched buffer for
+// the gamepad report.
+- (BOOL)processBuffer:(std::vector<uint8_t> &)buffer
+                 side:(JoyConSide)side
+          buttonState:(uint32_t)btnState
+         stickReading:(StickData)stickData
+        mouseDistance:(uint16_t)mouseDistance;
 
 @end
 

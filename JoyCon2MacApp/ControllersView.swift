@@ -156,7 +156,13 @@ struct ControllerCard: View {
                 MetricTile(
                     title: "Mouse",
                     value: controller.mouseMode.description,
-                    detail: "Distance \(controller.mouseDistance)",
+                    // When mouse is on, show which Joy-Con is currently
+                    // driving the pointer ("active: left/right"), plus
+                    // this side's distance so you can tell at a glance
+                    // which controller is on a surface.
+                    detail: controller.mouseMode == .off
+                        ? "Distance \(controller.mouseDistance)"
+                        : "Active: \(controller.mouseActiveSide.capitalized) · d=\(controller.mouseDistance)",
                     icon: "computermouse",
                     color: controller.mouseMode == .off ? .secondary : .accentColor
                 )
