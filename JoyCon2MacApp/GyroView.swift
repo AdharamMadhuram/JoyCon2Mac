@@ -87,14 +87,30 @@ struct GyroView: View {
         case .right: return canonicalRight
         case .fused:
             if let l = canonicalLeft, let r = canonicalRight {
-                // Straight arithmetic mean: both Joy-Cons in a grip share
-                // the same rigid-body orientation, so averaging suppresses
-                // per-sensor noise by roughly sqrt(2).
-                return IMUSample(accel: (l.accel + r.accel) * 0.5,
-                                 gyro:  (l.gyro  + r.gyro)  * 0.5)
+                // Match joycon2cpp's dual-source rule: average when both
+                // sides have an axis value, but if one side reports zero for
+                // that axis, use the non-zero side. This avoids visibly
+                // halving motion when one Joy-Con's IMU block is briefly
+                // all-zero during startup or recovery.
+                return IMUSample(accel: combineVectors(l.accel, r.accel),
+                                 gyro:  combineVectors(l.gyro,  r.gyro))
             }
             return canonicalLeft ?? canonicalRight
         }
+    }
+
+    private func combineVectors(_ left: SIMD3<Double>, _ right: SIMD3<Double>) -> SIMD3<Double> {
+        SIMD3(
+            combineComponent(left.x, right.x),
+            combineComponent(left.y, right.y),
+            combineComponent(left.z, right.z)
+        )
+    }
+
+    private func combineComponent(_ left: Double, _ right: Double) -> Double {
+        if left == 0 { return right }
+        if right == 0 { return left }
+        return (left + right) * 0.5
     }
 
     var body: some View {

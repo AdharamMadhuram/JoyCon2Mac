@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+
 # Apple requires the dext filename to equal its CFBundleIdentifier. sysextd
 # walks Contents/Library/SystemExtensions/ and pattern-matches the bundle id
 # against the file name, not against the Info.plist. Mismatches fail
@@ -30,7 +32,7 @@ embed_dext() {
     /bin/rm -rf "$SYSTEM_EXTENSIONS_DIR/VirtualJoyConDriver.dext"
     /bin/rm -rf "$SYSTEM_EXTENSIONS_DIR/$DEXT_NAME"
     cp -R "$source" "$SYSTEM_EXTENSIONS_DIR/$DEXT_NAME"
-    codesign -s - -f --deep \
+    codesign -s "$SIGN_IDENTITY" -f --deep --generate-entitlement-der \
         --entitlements "$ROOT_DIR/JoyCon2MacApp/JoyCon2Mac.entitlements" \
         "$ROOT_DIR/build/JoyCon2Mac.app" >/dev/null
 }

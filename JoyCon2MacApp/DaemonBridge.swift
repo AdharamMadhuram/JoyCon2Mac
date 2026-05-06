@@ -108,8 +108,8 @@ struct NFCTag: Identifiable {
 //
 // So the real fix is architectural:
 //   - Log tailing + JSON parsing run on a dedicated serial background queue.
-//   - State events are gated at 15 Hz per side inside that queue (so we only
-//     do expensive work once per 66 ms).
+//   - State events are gated at display-rate cadence on that queue. The old
+//     15 Hz gate was safe but visibly laggy for button/stick tester UI.
 //   - Only the gated, pre-built ControllerState is hopped onto main.
 //   - Telemetry log lines go to TelemetryStore, which batch-flushes to main
 //     every 200 ms. Settings/Logs views are the only subscribers.
@@ -134,9 +134,10 @@ class DaemonBridge: ObservableObject {
     private var pendingOutput = ""
     // Per-controller rate limiter (accessed only on ingestQueue).
     private var lastIngestTime: [String: Date] = [:]
-    private let controllerUpdateInterval: TimeInterval = 1.0 / 15.0
+    private let controllerUpdateInterval: TimeInterval = 1.0 / 120.0
     private var shouldRestartAfterTermination = false
     private var logPollTimer: DispatchSourceTimer?
+    private let logPollInterval: DispatchTimeInterval = .milliseconds(8)
     private var daemonLogPath: URL?
     private var daemonLogOffset: UInt64 = 0
     // Path the daemon polls for GUI → daemon commands (mouse-mode toggle etc).
@@ -429,7 +430,7 @@ class DaemonBridge: ObservableObject {
     private func startLogPolling() {
         stopLogPolling()
         let timer = DispatchSource.makeTimerSource(queue: ingestQueue)
-        timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+        timer.schedule(deadline: .now() + logPollInterval, repeating: logPollInterval, leeway: .milliseconds(1))
         timer.setEventHandler { [weak self] in
             self?.pollDaemonLogOnIngestQueue()
         }
@@ -514,7 +515,7 @@ class DaemonBridge: ObservableObject {
         }
 
         // Fast path: peek at "event" without full JSON parse so we can drop
-        // state packets that are inside the 15 Hz throttle window.
+        // state packets that are inside the display-rate throttle window.
         let maybeState = line.contains("\"event\":\"state\"")
         if maybeState {
             let side = extractStateSide(in: line) ?? "left"
@@ -562,7 +563,7 @@ class DaemonBridge: ObservableObject {
             let tag = NFCTag(
                 uid: uid,
                 type: object["type"] as? String ?? "Vendor",
-                data: Data(payloadHex.utf8),
+                data: dataFromHexString(payloadHex),
                 timestamp: Date()
             )
             DispatchQueue.main.async { [weak self] in self?.nfcTags.insert(tag, at: 0) }
@@ -650,12 +651,13 @@ class DaemonBridge: ObservableObject {
     // MARK: - Main-thread appliers
     //
     // We coalesce snapshots on the ingest queue into a small dictionary and
-    // flush to the Published array at most every 50 ms. That's 20 Hz UI
-    // refresh — still feels live but caps SwiftUI re-render pressure.
+    // flush to the Published array at display-rate cadence. Gamepad/mouse
+    // tester feedback must feel immediate, but we still avoid one main-thread
+    // publish per BLE packet.
     private var pendingStateSnapshots: [String: ControllerState] = [:]
     private var pendingStatusSnapshots: [String: ControllerStatusSnapshot] = [:]
     private var mainApplyScheduled: Bool = false
-    private let mainApplyInterval: TimeInterval = 0.05
+    private let mainApplyInterval: TimeInterval = 1.0 / 120.0
 
     // Picker flicker guard. When the user picks a new mouseMode or
     // mouseSource, the daemon takes up to ~200 ms to read the control file,
@@ -1029,5 +1031,23 @@ class DaemonBridge: ObservableObject {
         if let value = value as? NSNumber { return value.doubleValue }
         if let value = value as? String { return Double(value) ?? defaultValue }
         return defaultValue
+    }
+
+    private func dataFromHexString(_ hex: String) -> Data {
+        var bytes = Data()
+        var highNibble: UInt8?
+
+        for character in hex {
+            guard let nibble = character.hexDigitValue else { continue }
+            let value = UInt8(nibble)
+            if let high = highNibble {
+                bytes.append((high << 4) | value)
+                highNibble = nil
+            } else {
+                highNibble = value
+            }
+        }
+
+        return bytes
     }
 }

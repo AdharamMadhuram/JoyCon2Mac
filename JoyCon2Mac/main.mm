@@ -26,7 +26,7 @@ struct ControllerState {
     // sensor at the same packet offsets (0x10..0x13 for XY delta, 0x17 for
     // surface distance). Keeping a separate record per side lets the UI
     // show which controller is on a surface and lets the Auto source
-    // picker flip based on which one has distance != 0.
+    // picker flip based on which one has distance == 0.
     MouseData mouseLeft  = {0, 0, 0};
     MouseData mouseRight = {0, 0, 0};
     // Single "mouse" field preserved for the legacy printDetailedState().
@@ -47,6 +47,7 @@ static FILE *g_jsonFile = nullptr;
 static NSDate *g_lastPrintTime = nil;
 static NSDate *g_lastJSONLeftTime = nil;
 static NSDate *g_lastJSONRightTime = nil;
+static const NSTimeInterval kJSONStateIntervalSeconds = 1.0 / 120.0;
 static DriverKitClient *g_driverClient = nil;
 static MouseEmitter *g_mouseEmitter = nil;
 static BLEManager *g_bleManager = nil;
@@ -379,7 +380,7 @@ static void printJSONState(const std::vector<uint8_t>& buffer, JoyConSide side, 
 
     NSDate *lastJSONTime = side == JoyConSide::Right ? g_lastJSONRightTime : g_lastJSONLeftTime;
     NSDate *now = [NSDate date];
-    if (lastJSONTime && [now timeIntervalSinceDate:lastJSONTime] < 0.05) {
+    if (lastJSONTime && [now timeIntervalSinceDate:lastJSONTime] < kJSONStateIntervalSeconds) {
         return;
     }
     if (side == JoyConSide::Right) {

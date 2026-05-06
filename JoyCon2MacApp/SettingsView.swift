@@ -55,7 +55,7 @@ struct SettingsView: View {
                 SettingsActionRow(
                     icon: "puzzlepiece.extension",
                     title: "System Gamepad and Mouse",
-                    subtitle: "Install and load the local DriverKit extension so macOS, Chrome, and games can see JoyCon2Mac as a real HID device.",
+                    subtitle: "Install and load the local DriverKit extension so macOS and games can see JoyCon2Mac as a real HID device.",
                     buttonTitle: "Install/Load",
                     role: nil,
                     action: daemonBridge.installAndLoadDriver

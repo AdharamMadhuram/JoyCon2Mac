@@ -11,6 +11,15 @@ BUILD_DIR="build/xcode"
 GENERATED_DIR="build/generated"
 DRIVERKIT_SDK="$(xcrun --sdk driverkit --show-sdk-path)"
 
+SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+DEXT_PROVISIONING_PROFILE="${DEXT_PROVISIONING_PROFILE:-}"
+echo "Using code signing identity: $SIGN_IDENTITY"
+
+if [ -n "$DEXT_PROVISIONING_PROFILE" ] && [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "DEXT_PROVISIONING_PROFILE requires CODE_SIGN_IDENTITY to be set." >&2
+    exit 1
+fi
+
 # Create build directory
 mkdir -p "$BUILD_DIR"
 mkdir -p "$GENERATED_DIR"
@@ -30,7 +39,8 @@ xcrun --sdk driverkit iig \
 
 mkdir -p "$GENERATED_DIR/local.joycon2mac.driver"
 cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConDriver.h"
-cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConHIDDevice.h"
+cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConGamepadDevice.h"
+cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConMouseDevice.h"
 cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConUserClient.h"
 
 # Generate Xcode project
@@ -66,12 +76,34 @@ mkdir -p "$DEXT_MACOS"
 # CFBundleExecutable must also match the bundle-id-derived name so the
 # Mach-O inside the bundle can be located by the loader.
 cp "$DRIVER_BINARY" "$DEXT_MACOS/local.joycon2mac.driver"
-# CFBundleVersion must increase on every rebuild so sysextd/kernelmanagerd
-# actually treats the freshly-built dext as an upgrade instead of getting
-# stuck in "terminating for upgrade via delegate" when the on-disk
-# staged bundle has the same version. Use BUILD_STAMP (current epoch) so
-# every build is unique.
-BUILD_STAMP=$(date +%Y.%m.%d.%H%M%S)
+# CFBundleVersion must increase on rebuilds, but DriverKit validates it with
+# kext version rules: ####.##.## plus an optional build-stage suffix d/a/b/f/fc
+# in the range 1-255. Four numeric components such as 2026.05.06.055604 are
+# rejected by kernelmanagerd before the dext can activate.
+BUILD_STAMP=$(/usr/bin/python3 - <<'PY'
+from datetime import datetime
+from pathlib import Path
+
+state_path = Path("build/.driver_cfversion_counter")
+state_path.parent.mkdir(parents=True, exist_ok=True)
+
+now = datetime.now()
+date_key = now.strftime("%Y%m%d")
+version_base = now.strftime("%Y.%m.%d")
+counter = 1
+
+if state_path.exists():
+    parts = state_path.read_text(encoding="utf-8").strip().split()
+    if len(parts) == 2 and parts[0] == date_key:
+        counter = int(parts[1]) + 1
+
+if counter > 255:
+    raise SystemExit("DriverKit CFBundleVersion daily build counter exceeded 255")
+
+state_path.write_text(f"{date_key} {counter}\n", encoding="utf-8")
+print(f"{version_base}d{counter}")
+PY
+)
 cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -109,7 +141,7 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
       System Settings approval prompt, so keep it human-readable.
     -->
     <key>OSBundleUsageDescription</key>
-    <string>JoyCon2Mac Virtual HID Driver — exposes paired Joy-Con 2 controllers as a system gamepad and mouse so games, browsers, and macOS itself can use them as real HID devices.</string>
+    <string>JoyCon2Mac Virtual HID Driver — exposes paired Joy-Con 2 controllers as a system gamepad and mouse so games and macOS itself can use them as real HID devices.</string>
     <!--
       Personality layout follows the Karabiner-DriverKit-VirtualHIDDevice
       reference (pqrs-org/Karabiner-DriverKit-VirtualHIDDevice, Info.plist.in)
@@ -121,13 +153,10 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
         * Root personality matches on IOUserResources and exposes a user
           client (IOUserUserClient / VirtualJoyConUserClient). Does NOT
           publish an HID device itself.
-        * UserClient holds a nested HIDDeviceProperties personality with
-          IOClass=AppleUserHIDDevice + IOUserClass=VirtualJoyConHIDDevice.
-          The daemon triggers creation of that HID device by calling
-          IOService::Create(self, "HIDDeviceProperties", ...) on the first
-          report. This is why the gamepad only appears in the HID tree
-          once the daemon actually starts pushing data, matching how
-          Karabiner's virtual keyboard/pointing devices appear on demand.
+        * UserClient holds separate nested gamepad and mouse personalities.
+          This mirrors Karabiner's split keyboard/pointing devices and avoids
+          Apple's GameController stack classifying the old composite
+          gamepad+mouse descriptor as GCMouse only.
     -->
     <key>IOKitPersonalities</key>
     <dict>
@@ -155,21 +184,11 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
                 <string>IOUserUserClient</string>
                 <key>IOUserClass</key>
                 <string>VirtualJoyConUserClient</string>
-                <!--
-                  Empty IOServiceDEXTEntitlements declares that the user
-                  client accepts connections without requiring the host
-                  app to carry a com.apple.developer.driverkit.userclient-
-                  access entitlement. With SIP off + ad-hoc signing this
-                  is required — otherwise IOServiceOpen returns 0xE00002C7
-                  (kIOReturnNotPermitted).
-                -->
-                <key>IOServiceDEXTEntitlements</key>
-                <string></string>
-                <key>HIDDeviceProperties</key>
+                <key>GamepadDeviceProperties</key>
                 <dict>
                     <!--
                       AppleUserHIDDevice is the kernel half that backs a
-                      DEXT-provided HID device; our VirtualJoyConHIDDevice
+                      DEXT-provided HID device; our VirtualJoyConGamepadDevice
                       (subclass of IOUserHIDDevice) is the DEXT half. This
                       pairing is what makes the device show up as a real
                       IOHIDDevice nub in IOKit, which is prerequisite for
@@ -179,7 +198,14 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
                     <key>IOClass</key>
                     <string>AppleUserHIDDevice</string>
                     <key>IOUserClass</key>
-                    <string>VirtualJoyConHIDDevice</string>
+                    <string>VirtualJoyConGamepadDevice</string>
+                </dict>
+                <key>MouseDeviceProperties</key>
+                <dict>
+                    <key>IOClass</key>
+                    <string>AppleUserHIDDevice</string>
+                    <key>IOUserClass</key>
+                    <string>VirtualJoyConMouseDevice</string>
                 </dict>
             </dict>
         </dict>
@@ -188,9 +214,13 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
+if [ -n "$DEXT_PROVISIONING_PROFILE" ]; then
+    cp "$DEXT_PROVISIONING_PROFILE" "$DEXT_CONTENTS/embedded.provisionprofile"
+fi
+
 # Sign the driver
 echo "Step 4: Signing driver..."
-codesign -s - -f --entitlements VirtualJoyConDriver/VirtualJoyConDriver.entitlements "$DEXT_DIR"
+codesign -s "$SIGN_IDENTITY" -f --generate-entitlement-der --entitlements VirtualJoyConDriver/VirtualJoyConDriver.entitlements "$DEXT_DIR"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>JoyCon2Mac</string>
     <key>CFBundleIdentifier</key>
-    <string>local.joycon2mac</string>
+    <string>local.joycon2mac.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

@@ -1,6 +1,66 @@
 #import "DriverKitClient.h"
 #import <IOKit/IOKitLib.h>
 
+static BOOL servicePropertyEquals(io_service_t service, CFStringRef key, CFStringRef expected) {
+    if (service == IO_OBJECT_NULL) return NO;
+
+    CFTypeRef value = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0);
+    if (!value) return NO;
+
+    BOOL equals = CFGetTypeID(value) == CFStringGetTypeID() && CFEqual(value, expected);
+    CFRelease(value);
+    return equals;
+}
+
+static BOOL isVirtualJoyConService(io_service_t service) {
+    return servicePropertyEquals(service, CFSTR("IOUserClass"), CFSTR("VirtualJoyConDriver")) &&
+           servicePropertyEquals(service, CFSTR("CFBundleIdentifier"), CFSTR("local.joycon2mac.driver")) &&
+           servicePropertyEquals(service, CFSTR("IOUserServerName"), CFSTR("local.joycon2mac.driver"));
+}
+
+static io_service_t copyVirtualJoyConServiceFromIterator(io_iterator_t iterator) {
+    io_service_t service = IO_OBJECT_NULL;
+    while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        if (isVirtualJoyConService(service)) {
+            return service;
+        }
+        IOObjectRelease(service);
+    }
+    return IO_OBJECT_NULL;
+}
+
+static io_service_t copyVirtualJoyConService(void) {
+    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                       IOServiceNameMatching("VirtualJoyConDriver"));
+    if (service != IO_OBJECT_NULL) {
+        if (isVirtualJoyConService(service)) {
+            return service;
+        }
+        IOObjectRelease(service);
+    }
+
+    service = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                          IOServiceMatching("VirtualJoyConDriver"));
+    if (service != IO_OBJECT_NULL) {
+        if (isVirtualJoyConService(service)) {
+            return service;
+        }
+        IOObjectRelease(service);
+    }
+
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault,
+                                                    IOServiceMatching("IOUserService"),
+                                                    &iterator);
+    if (kr != KERN_SUCCESS || iterator == IO_OBJECT_NULL) {
+        return IO_OBJECT_NULL;
+    }
+
+    service = copyVirtualJoyConServiceFromIterator(iterator);
+    IOObjectRelease(iterator);
+    return service;
+}
+
 @interface DriverKitClient ()
 @property (nonatomic, assign) io_service_t service;
 @property (nonatomic, assign) io_connect_t connection;
@@ -29,22 +89,7 @@
 - (BOOL)start {
     if (_isRunning) return YES;
 
-    // A DriverKit service's in-kernel IOClass is IOUserService — matching
-    // on that name would find every DEXT on the system. Instead we match
-    // on IOUserClass, which the kernel side copies verbatim from the DEXT's
-    // Info.plist personality. That narrows the lookup to exactly our
-    // VirtualJoyConDriver. (IOServiceMatching() on its own fills in
-    // "IOProviderClass", which we don't want here, so we build the dict
-    // manually.)
-    CFMutableDictionaryRef matchingDict =
-        CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
-                                  &kCFTypeDictionaryKeyCallBacks,
-                                  &kCFTypeDictionaryValueCallBacks);
-    if (!matchingDict) return NO;
-    CFStringRef userClass = CFSTR("VirtualJoyConDriver");
-    CFDictionarySetValue(matchingDict, CFSTR("IOUserClass"), userClass);
-
-    _service = IOServiceGetMatchingService(kIOMasterPortDefault, matchingDict);
+    _service = copyVirtualJoyConService();
     if (_service == IO_OBJECT_NULL) {
         NSLog(@"[DriverKitClient] ✗ VirtualJoyConDriver not found. Is the extension loaded?");
         return NO;

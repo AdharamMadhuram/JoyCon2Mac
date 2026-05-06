@@ -55,18 +55,14 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Virtual HID Device (created dynamically from the UserClient)
+// Virtual Gamepad HID Device (created dynamically from the UserClient)
 // ---------------------------------------------------------------------------
 //
 // Subclasses IOUserHIDDevice and is instantiated when the daemon opens a
-// user client for the first time. The Info.plist declares its personality
-// under UserClientProperties > HIDDeviceProperties with IOClass =
-// AppleUserHIDDevice + IOUserClass = VirtualJoyConHIDDevice, which is what
-// the kernel looks for when the root calls Create(this, "HIDDeviceProperties",
-// ...). From here on it behaves like a real HID device, announcing the
-// composite (gamepad + mouse + vendor-defined) report descriptor and
-// dispatching reports via handleReport().
-class VirtualJoyConHIDDevice : public IOUserHIDDevice
+// user client. Keep gamepad and mouse as separate IOHIDDevice nubs; Apple's
+// GameController stack classified the old composite gamepad+mouse descriptor
+// as GCMouse, which kept it out of GCController/System Settings.
+class VirtualJoyConGamepadDevice : public IOUserHIDDevice
 {
 public:
     virtual bool init() override;
@@ -83,8 +79,28 @@ public:
 
     // Called from the UserClient when new report data arrives from the daemon.
     kern_return_t dispatchGamepadReport(JoyConReportData reportData) LOCALONLY;
-    kern_return_t dispatchMouseReport(JoyConMouseReportData reportData) LOCALONLY;
     kern_return_t dispatchNFCReport(JoyConNFCReportData reportData) LOCALONLY;
+};
+
+// ---------------------------------------------------------------------------
+// Virtual Mouse HID Device (created dynamically from the UserClient)
+// ---------------------------------------------------------------------------
+class VirtualJoyConMouseDevice : public IOUserHIDDevice
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
+
+    virtual OSDictionary * newDeviceDescription() override;
+    virtual OSData * newReportDescriptor() override;
+
+    virtual kern_return_t setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
+    virtual kern_return_t getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
+
+    kern_return_t dispatchMouseReport(JoyConMouseReportData reportData) LOCALONLY;
 };
 
 // ---------------------------------------------------------------------------

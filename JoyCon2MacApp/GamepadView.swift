@@ -39,6 +39,9 @@ struct GamepadView: View {
                 }
             }
         }
+        .transaction { transaction in
+            transaction.animation = nil
+        }
     }
 
     private var emptyState: some View {
@@ -216,13 +219,35 @@ private struct ShoulderGroup: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                ProgressView(value: Double(triggerValue), total: 255)
+                TriggerMeter(value: triggerValue, color: .purple)
             }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(NSColor.controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct TriggerMeter: View {
+    let value: UInt8
+    let color: Color
+
+    private var normalizedValue: CGFloat {
+        CGFloat(value) / 255.0
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.secondary.opacity(0.18))
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(color)
+                    .frame(width: proxy.size.width * normalizedValue)
+            }
+        }
+        .frame(height: 6)
     }
 }
 

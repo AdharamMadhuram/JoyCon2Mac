@@ -17,12 +17,12 @@
 // ---------------------------------------------------------------------------
 // Packed wire formats for the three HID report types.
 //
-// reportId = 1 : composite gamepad (buttons + dpad hat + two sticks + triggers)
+// reportId = 1 : gamepad (buttons + dpad hat + two sticks + triggers)
 // reportId = 2 : mouse (buttons, dx, dy, wheel)
 // reportId = 3 : vendor-defined NFC blob
 // Byte layouts MUST match the descriptor byte-for-byte or macOS rejects the
-// reports silently. See VirtualCompositeDescriptor below for the authoritative
-// descriptor.
+// reports silently. The report IDs remain stable even though gamepad and mouse
+// are now published as separate HID devices.
 // ---------------------------------------------------------------------------
 struct JoyConHIDGamepadReport {
     uint8_t  reportId;
@@ -58,20 +58,10 @@ enum : uint64_t {
     kVirtualJoyConSelectorCount   = 3
 };
 
-// Bridging singleton between the UserClient (which receives report data from
-// the daemon) and the live HID device (which owns the IOHIDDevice nub). Set
-// by VirtualJoyConHIDDevice::Start and cleared in Stop, so the UserClient
-// always dispatches to the most recent device. The alternative — storing a
-// pointer inside the UserClient instance — falls over during re-pair/relaunch
-// because the DEXT framework tears down and recreates the HID device without
-// recreating the UserClient.
-static VirtualJoyConHIDDevice * gLiveHIDDevice = nullptr;
-
 // ---------------------------------------------------------------------------
-// Composite HID descriptor: gamepad (ID 1) + mouse (ID 2) + NFC vendor (ID 3)
+// Gamepad HID descriptor: gamepad (ID 1) + NFC vendor (ID 3)
 // ---------------------------------------------------------------------------
-const uint8_t VirtualCompositeDescriptor[] = {
-    // --- GAMEPAD (Report ID 1) ---
+const uint8_t VirtualGamepadDescriptor[] = {
     0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
     0x09, 0x05,        // Usage (Game Pad)
     0xA1, 0x01,        // Collection (Application)
@@ -136,7 +126,39 @@ const uint8_t VirtualCompositeDescriptor[] = {
 
     0xC0,              // End Collection
 
-    // --- MOUSE (Report ID 2) ---
+    // --- NFC (Vendor Defined - Report ID 3) ---
+    0x06, 0x00, 0xFF,  // Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x01,        // Usage (0x01)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x03,        //   Report ID (3)
+
+    // Status (1 byte)
+    0x09, 0x02,        //   Usage (0x02)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x08,        //   Report Size (8)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+
+    // Tag ID (7 bytes)
+    0x09, 0x03,        //   Usage (0x03)
+    0x95, 0x07,        //   Report Count (7)
+    0x75, 0x08,        //   Report Size (8)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+
+    // Payload (32 bytes)
+    0x09, 0x04,        //   Usage (0x04)
+    0x95, 0x20,        //   Report Count (32)
+    0x75, 0x08,        //   Report Size (8)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+
+    0xC0               // End Collection
+};
+
+// ---------------------------------------------------------------------------
+// Mouse HID descriptor: mouse (ID 2)
+// ---------------------------------------------------------------------------
+const uint8_t VirtualMouseDescriptor[] = {
     0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x02,        // Usage (Mouse)
     0xA1, 0x01,        // Collection (Application)
@@ -178,34 +200,6 @@ const uint8_t VirtualCompositeDescriptor[] = {
     0x81, 0x06,        //     Input (Data,Var,Rel)
 
     0xC0,              //   End Collection
-    0xC0,              // End Collection
-
-    // --- NFC (Vendor Defined - Report ID 3) ---
-    0x06, 0x00, 0xFF,  // Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x01,        // Usage (0x01)
-    0xA1, 0x01,        // Collection (Application)
-    0x85, 0x03,        //   Report ID (3)
-
-    // Status (1 byte)
-    0x09, 0x02,        //   Usage (0x02)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x02,        //   Input (Data,Var,Abs)
-
-    // Tag ID (7 bytes)
-    0x09, 0x03,        //   Usage (0x03)
-    0x95, 0x07,        //   Report Count (7)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x02,        //   Input (Data,Var,Abs)
-
-    // Payload (32 bytes)
-    0x09, 0x04,        //   Usage (0x04)
-    0x95, 0x20,        //   Report Count (32)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x02,        //   Input (Data,Var,Abs)
-
     0xC0               // End Collection
 };
 
@@ -277,23 +271,23 @@ kern_return_t VirtualJoyConDriver::NewUserClient_Impl(uint32_t type, IOUserClien
 }
 
 // ===========================================================================
-// VirtualJoyConHIDDevice — the actual HID device published to the system
+// VirtualJoyConGamepadDevice — the gamepad HID device published to the system
 // ===========================================================================
 
-bool VirtualJoyConHIDDevice::init() {
+bool VirtualJoyConGamepadDevice::init() {
     return super::init();
 }
 
-void VirtualJoyConHIDDevice::free() {
+void VirtualJoyConGamepadDevice::free() {
     super::free();
 }
 
-kern_return_t VirtualJoyConHIDDevice::Start_Impl(IOService * provider) {
-    os_log(OS_LOG_DEFAULT, "VirtualJoyConHIDDevice::Start");
+kern_return_t VirtualJoyConGamepadDevice::Start_Impl(IOService * provider) {
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConGamepadDevice::Start");
 
     kern_return_t ret = Start(provider, SUPERDISPATCH);
     if (ret != kIOReturnSuccess) {
-        os_log(OS_LOG_DEFAULT, "VirtualJoyConHIDDevice::super::Start failed 0x%x", ret);
+        os_log(OS_LOG_DEFAULT, "VirtualJoyConGamepadDevice::super::Start failed 0x%x", ret);
         return ret;
     }
 
@@ -302,31 +296,24 @@ kern_return_t VirtualJoyConHIDDevice::Start_Impl(IOService * provider) {
     // by the time RegisterService returns we have a live /dev/input entry.
     ret = RegisterService();
     if (ret != kIOReturnSuccess) {
-        os_log(OS_LOG_DEFAULT, "VirtualJoyConHIDDevice::RegisterService failed 0x%x", ret);
+        os_log(OS_LOG_DEFAULT, "VirtualJoyConGamepadDevice::RegisterService failed 0x%x", ret);
         return ret;
     }
 
-    // Expose ourselves so the UserClient can route reports through us. No
-    // retain needed — the UserClient holds a reference to the provider
-    // chain that keeps us alive while it's open.
-    gLiveHIDDevice = this;
-    os_log(OS_LOG_DEFAULT, "VirtualJoyConHIDDevice ready");
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConGamepadDevice ready");
     return kIOReturnSuccess;
 }
 
-kern_return_t VirtualJoyConHIDDevice::Stop_Impl(IOService * provider) {
-    os_log(OS_LOG_DEFAULT, "VirtualJoyConHIDDevice::Stop");
-    if (gLiveHIDDevice == this) {
-        gLiveHIDDevice = nullptr;
-    }
+kern_return_t VirtualJoyConGamepadDevice::Stop_Impl(IOService * provider) {
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConGamepadDevice::Stop");
     return Stop(provider, SUPERDISPATCH);
 }
 
-OSData * VirtualJoyConHIDDevice::newReportDescriptor() {
-    return OSData::withBytes(VirtualCompositeDescriptor, sizeof(VirtualCompositeDescriptor));
+OSData * VirtualJoyConGamepadDevice::newReportDescriptor() {
+    return OSData::withBytes(VirtualGamepadDescriptor, sizeof(VirtualGamepadDescriptor));
 }
 
-OSDictionary * VirtualJoyConHIDDevice::newDeviceDescription() {
+OSDictionary * VirtualJoyConGamepadDevice::newDeviceDescription() {
     OSDictionary * description = OSDictionary::withCapacity(8);
     if (!description) {
         return nullptr;
@@ -337,7 +324,7 @@ OSDictionary * VirtualJoyConHIDDevice::newDeviceDescription() {
     OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
     OSString * transport    = OSString::withCString("Virtual");
     OSString * manufacturer = OSString::withCString("JoyCon2Mac");
-    OSString * productName  = OSString::withCString("Joy-Con 2 (Virtual)");
+    OSString * productName  = OSString::withCString("Joy-Con 2 Gamepad (Virtual)");
 
     if (vendor)       { description->setObject(kIOHIDVendorIDKey,       vendor);       vendor->release(); }
     if (product)      { description->setObject(kIOHIDProductIDKey,      product);      product->release(); }
@@ -349,15 +336,15 @@ OSDictionary * VirtualJoyConHIDDevice::newDeviceDescription() {
     return description;
 }
 
-kern_return_t VirtualJoyConHIDDevice::setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) {
+kern_return_t VirtualJoyConGamepadDevice::setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) {
     return kIOReturnUnsupported;
 }
 
-kern_return_t VirtualJoyConHIDDevice::getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) {
+kern_return_t VirtualJoyConGamepadDevice::getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) {
     return kIOReturnUnsupported;
 }
 
-kern_return_t VirtualJoyConHIDDevice::dispatchGamepadReport(JoyConReportData reportData) {
+kern_return_t VirtualJoyConGamepadDevice::dispatchGamepadReport(JoyConReportData reportData) {
     JoyConHIDGamepadReport report = {};
     report.reportId = 1;
     report.buttons  = reportData.buttons & 0x3FFFF; // 18 bits max
@@ -384,30 +371,7 @@ kern_return_t VirtualJoyConHIDDevice::dispatchGamepadReport(JoyConReportData rep
     return ret;
 }
 
-kern_return_t VirtualJoyConHIDDevice::dispatchMouseReport(JoyConMouseReportData reportData) {
-    JoyConHIDMouseReport report = {};
-    report.reportId = 2;
-    report.buttons  = reportData.buttons;
-    report.x        = reportData.deltaX;
-    report.y        = reportData.deltaY;
-    report.wheel    = reportData.scroll;
-
-    IOBufferMemoryDescriptor * md = nullptr;
-    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, sizeof(report), 0, &md);
-    if (ret == kIOReturnSuccess && md != nullptr) {
-        IOAddressSegment range = {};
-        if (md->GetAddressRange(&range) == kIOReturnSuccess &&
-            range.address != 0 && range.length >= sizeof(report)) {
-            memcpy((void *)range.address, &report, sizeof(report));
-            md->SetLength(sizeof(report));
-            ret = handleReport(0, md, sizeof(report), kIOHIDReportTypeInput, 0);
-        }
-        md->release();
-    }
-    return ret;
-}
-
-kern_return_t VirtualJoyConHIDDevice::dispatchNFCReport(JoyConNFCReportData reportData) {
+kern_return_t VirtualJoyConGamepadDevice::dispatchNFCReport(JoyConNFCReportData reportData) {
     JoyConHIDNFCReport report = {};
     report.reportId = 3;
     report.status   = reportData.status;
@@ -430,63 +394,229 @@ kern_return_t VirtualJoyConHIDDevice::dispatchNFCReport(JoyConNFCReportData repo
 }
 
 // ===========================================================================
-// VirtualJoyConUserClient — bridges the daemon to the HID device
+// VirtualJoyConMouseDevice — the mouse HID device published to the system
 // ===========================================================================
-//
-// Lazily creates the VirtualJoyConHIDDevice on first use instead of at Start.
-// That way a user just running the app without pairing doesn't cause an
-// empty virtual gamepad to show up in every game's controller picker.
 
-bool VirtualJoyConUserClient::init() {
+bool VirtualJoyConMouseDevice::init() {
     return super::init();
 }
 
+void VirtualJoyConMouseDevice::free() {
+    super::free();
+}
+
+kern_return_t VirtualJoyConMouseDevice::Start_Impl(IOService * provider) {
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConMouseDevice::Start");
+
+    kern_return_t ret = Start(provider, SUPERDISPATCH);
+    if (ret != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT, "VirtualJoyConMouseDevice::super::Start failed 0x%x", ret);
+        return ret;
+    }
+
+    ret = RegisterService();
+    if (ret != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT, "VirtualJoyConMouseDevice::RegisterService failed 0x%x", ret);
+        return ret;
+    }
+
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConMouseDevice ready");
+    return kIOReturnSuccess;
+}
+
+kern_return_t VirtualJoyConMouseDevice::Stop_Impl(IOService * provider) {
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConMouseDevice::Stop");
+    return Stop(provider, SUPERDISPATCH);
+}
+
+OSData * VirtualJoyConMouseDevice::newReportDescriptor() {
+    return OSData::withBytes(VirtualMouseDescriptor, sizeof(VirtualMouseDescriptor));
+}
+
+OSDictionary * VirtualJoyConMouseDevice::newDeviceDescription() {
+    OSDictionary * description = OSDictionary::withCapacity(8);
+    if (!description) {
+        return nullptr;
+    }
+
+    OSNumber * vendor       = OSNumber::withNumber(static_cast<uint32_t>(0x057E), 32);
+    OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x2067), 32);
+    OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
+    OSString * transport    = OSString::withCString("Virtual");
+    OSString * manufacturer = OSString::withCString("JoyCon2Mac");
+    OSString * productName  = OSString::withCString("Joy-Con 2 Mouse (Virtual)");
+
+    if (vendor)       { description->setObject(kIOHIDVendorIDKey,       vendor);       vendor->release(); }
+    if (product)      { description->setObject(kIOHIDProductIDKey,      product);      product->release(); }
+    if (version)      { description->setObject(kIOHIDVersionNumberKey,  version);      version->release(); }
+    if (transport)    { description->setObject(kIOHIDTransportKey,      transport);    transport->release(); }
+    if (manufacturer) { description->setObject(kIOHIDManufacturerKey,   manufacturer); manufacturer->release(); }
+    if (productName)  { description->setObject(kIOHIDProductKey,        productName);  productName->release(); }
+
+    return description;
+}
+
+kern_return_t VirtualJoyConMouseDevice::setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) {
+    return kIOReturnUnsupported;
+}
+
+kern_return_t VirtualJoyConMouseDevice::getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) {
+    return kIOReturnUnsupported;
+}
+
+kern_return_t VirtualJoyConMouseDevice::dispatchMouseReport(JoyConMouseReportData reportData) {
+    JoyConHIDMouseReport report = {};
+    report.reportId = 2;
+    report.buttons  = reportData.buttons;
+    report.x        = reportData.deltaX;
+    report.y        = reportData.deltaY;
+    report.wheel    = reportData.scroll;
+
+    IOBufferMemoryDescriptor * md = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, sizeof(report), 0, &md);
+    if (ret == kIOReturnSuccess && md != nullptr) {
+        IOAddressSegment range = {};
+        if (md->GetAddressRange(&range) == kIOReturnSuccess &&
+            range.address != 0 && range.length >= sizeof(report)) {
+            memcpy((void *)range.address, &report, sizeof(report));
+            md->SetLength(sizeof(report));
+            ret = handleReport(0, md, sizeof(report), kIOHIDReportTypeInput, 0);
+        }
+        md->release();
+    }
+    return ret;
+}
+
+// ===========================================================================
+// VirtualJoyConUserClient — bridges the daemon to the HID device
+// ===========================================================================
+//
+// Owns the gamepad and mouse HID children while the daemon is connected. Keep
+// this close to Karabiner's lifecycle: Create(), retain via ivars, release on
+// user-client teardown. The split devices are important because Apple's
+// GameController stack classified the old composite device as GCMouse only.
+
+struct VirtualJoyConUserClient_IVars {
+    VirtualJoyConGamepadDevice * gamepadDevice;
+    VirtualJoyConMouseDevice * mouseDevice;
+};
+
+static kern_return_t ensureGamepadDevice(VirtualJoyConUserClient * self);
+static kern_return_t ensureMouseDevice(VirtualJoyConUserClient * self);
+static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self);
+
+static void releaseHIDDevices(VirtualJoyConUserClient * self) {
+    if (!self || !self->ivars) {
+        return;
+    }
+    if (self->ivars->gamepadDevice) {
+        self->ivars->gamepadDevice->release();
+        self->ivars->gamepadDevice = nullptr;
+    }
+    if (self->ivars->mouseDevice) {
+        self->ivars->mouseDevice->release();
+        self->ivars->mouseDevice = nullptr;
+    }
+}
+
+bool VirtualJoyConUserClient::init() {
+    if (!super::init()) {
+        return false;
+    }
+    ivars = IONewZero(VirtualJoyConUserClient_IVars, 1);
+    return ivars != nullptr;
+}
+
 void VirtualJoyConUserClient::free() {
+    releaseHIDDevices(this);
+    IOSafeDeleteNULL(ivars, VirtualJoyConUserClient_IVars, 1);
     super::free();
 }
 
 kern_return_t VirtualJoyConUserClient::Start_Impl(IOService * provider) {
     os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient::Start");
-    return Start(provider, SUPERDISPATCH);
+    kern_return_t ret = Start(provider, SUPERDISPATCH);
+    if (ret != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient::super::Start failed 0x%x", ret);
+        return ret;
+    }
+
+    ret = ensureAllHIDDevices(this);
+    if (ret != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient::ensureAllHIDDevices failed 0x%x", ret);
+        releaseHIDDevices(this);
+        Stop(provider, SUPERDISPATCH);
+        return ret;
+    }
+    os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient::Start ready");
+    return kIOReturnSuccess;
 }
 
 kern_return_t VirtualJoyConUserClient::Stop_Impl(IOService * provider) {
+    releaseHIDDevices(this);
     return Stop(provider, SUPERDISPATCH);
 }
 
-// Helper: ensure the HID device exists, lazy-creating it on first call. This
-// is the Karabiner pattern: the UserClient owns instantiation of the HID
-// subdevice so the root service stays passive. Safe to call repeatedly —
-// subsequent calls short-circuit on the gLiveHIDDevice bridging pointer.
-static kern_return_t ensureHIDDevice(VirtualJoyConUserClient * self) {
-    if (gLiveHIDDevice != nullptr) {
-        return kIOReturnSuccess;
-    }
-    if (!self) {
+static kern_return_t ensureGamepadDevice(VirtualJoyConUserClient * self) {
+    if (!self || !self->ivars) {
         return kIOReturnBadArgument;
+    }
+    if (self->ivars->gamepadDevice != nullptr) {
+        return kIOReturnSuccess;
     }
 
     IOService * created = nullptr;
-    kern_return_t kr = self->Create(self, "HIDDeviceProperties", &created);
+    kern_return_t kr = self->Create(self, "GamepadDeviceProperties", &created);
     if (kr != kIOReturnSuccess) {
         os_log(OS_LOG_DEFAULT,
-               "VirtualJoyConUserClient: Create(HIDDeviceProperties) failed 0x%x", kr);
+               "VirtualJoyConUserClient: Create(GamepadDeviceProperties) failed 0x%x", kr);
         return kr;
     }
-    // Ownership now lives in the IORegistry via the parent chain. The
-    // HIDDevice sets gLiveHIDDevice from its own Start, so we don't need
-    // to cast here — just release our extra reference. Mirrors Karabiner's
-    // VirtualHIDDeviceUserClient creation path.
-    VirtualJoyConHIDDevice * dev = OSDynamicCast(VirtualJoyConHIDDevice, created);
+    VirtualJoyConGamepadDevice * dev = OSDynamicCast(VirtualJoyConGamepadDevice, created);
     if (!dev) {
         os_log(OS_LOG_DEFAULT,
-               "VirtualJoyConUserClient: HID device class mismatch after Create");
+               "VirtualJoyConUserClient: gamepad device class mismatch after Create");
         if (created) created->release();
         return kIOReturnUnsupported;
     }
-    // Release our transient reference — the framework keeps the device alive.
-    dev->release();
+
+    self->ivars->gamepadDevice = dev;
     return kIOReturnSuccess;
+}
+
+static kern_return_t ensureMouseDevice(VirtualJoyConUserClient * self) {
+    if (!self || !self->ivars) {
+        return kIOReturnBadArgument;
+    }
+    if (self->ivars->mouseDevice != nullptr) {
+        return kIOReturnSuccess;
+    }
+
+    IOService * created = nullptr;
+    kern_return_t kr = self->Create(self, "MouseDeviceProperties", &created);
+    if (kr != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT,
+               "VirtualJoyConUserClient: Create(MouseDeviceProperties) failed 0x%x", kr);
+        return kr;
+    }
+    VirtualJoyConMouseDevice * dev = OSDynamicCast(VirtualJoyConMouseDevice, created);
+    if (!dev) {
+        os_log(OS_LOG_DEFAULT,
+               "VirtualJoyConUserClient: mouse device class mismatch after Create");
+        if (created) created->release();
+        return kIOReturnUnsupported;
+    }
+
+    self->ivars->mouseDevice = dev;
+    return kIOReturnSuccess;
+}
+
+static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self) {
+    kern_return_t kr = ensureGamepadDevice(self);
+    if (kr != kIOReturnSuccess) {
+        return kr;
+    }
+    return ensureMouseDevice(self);
 }
 
 static kern_return_t PostGamepadReport(OSObject * target, void * reference, IOUserClientMethodArguments * arguments) {
@@ -494,11 +624,11 @@ static kern_return_t PostGamepadReport(OSObject * target, void * reference, IOUs
     if (!client || !arguments || !arguments->structureInput) {
         return kIOReturnBadArgument;
     }
-    kern_return_t kr = ensureHIDDevice(client);
+    kern_return_t kr = ensureGamepadDevice(client);
     if (kr != kIOReturnSuccess) {
         return kr;
     }
-    VirtualJoyConHIDDevice * device = gLiveHIDDevice;
+    VirtualJoyConGamepadDevice * device = client->ivars ? client->ivars->gamepadDevice : nullptr;
     if (!device) {
         return kIOReturnNotAttached;
     }
@@ -516,11 +646,11 @@ static kern_return_t PostMouseReport(OSObject * target, void * reference, IOUser
     if (!client || !arguments || !arguments->structureInput) {
         return kIOReturnBadArgument;
     }
-    kern_return_t kr = ensureHIDDevice(client);
+    kern_return_t kr = ensureMouseDevice(client);
     if (kr != kIOReturnSuccess) {
         return kr;
     }
-    VirtualJoyConHIDDevice * device = gLiveHIDDevice;
+    VirtualJoyConMouseDevice * device = client->ivars ? client->ivars->mouseDevice : nullptr;
     if (!device) {
         return kIOReturnNotAttached;
     }
@@ -538,11 +668,11 @@ static kern_return_t PostNFCReport(OSObject * target, void * reference, IOUserCl
     if (!client || !arguments || !arguments->structureInput) {
         return kIOReturnBadArgument;
     }
-    kern_return_t kr = ensureHIDDevice(client);
+    kern_return_t kr = ensureGamepadDevice(client);
     if (kr != kIOReturnSuccess) {
         return kr;
     }
-    VirtualJoyConHIDDevice * device = gLiveHIDDevice;
+    VirtualJoyConGamepadDevice * device = client->ivars ? client->ivars->gamepadDevice : nullptr;
     if (!device) {
         return kIOReturnNotAttached;
     }

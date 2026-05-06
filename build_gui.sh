@@ -12,6 +12,15 @@ HELPER_CONTENTS="$HELPER_APP/Contents"
 HELPER_MACOS="$HELPER_CONTENTS/MacOS"
 APP_ENTITLEMENTS="$ROOT_DIR/JoyCon2MacApp/JoyCon2Mac.entitlements"
 
+SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+APP_PROVISIONING_PROFILE="${APP_PROVISIONING_PROFILE:-}"
+echo "Using code signing identity: $SIGN_IDENTITY"
+
+if [ -n "$APP_PROVISIONING_PROFILE" ] && [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "APP_PROVISIONING_PROFILE requires CODE_SIGN_IDENTITY to be set." >&2
+    exit 1
+fi
+
 echo "Building JoyCon2Mac daemon..."
 cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$ROOT_DIR/build" --target joycon2mac --config Release --parallel "$(sysctl -n hw.ncpu)"
@@ -26,6 +35,9 @@ echo "Building JoyCon2Mac.app..."
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$HELPER_MACOS"
 cp "$ROOT_DIR/JoyCon2MacApp/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$DAEMON" "$HELPER_MACOS/joycon2mac"
+if [ -n "$APP_PROVISIONING_PROFILE" ]; then
+    cp "$APP_PROVISIONING_PROFILE" "$CONTENTS_DIR/embedded.provisionprofile"
+fi
 cat > "$HELPER_CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -72,7 +84,7 @@ swiftc \
     "$ROOT_DIR"/JoyCon2MacApp/*.swift \
     -o "$MACOS_DIR/JoyCon2Mac"
 
-codesign -s - -f "$HELPER_APP" >/dev/null
-codesign -s - -f --deep --entitlements "$APP_ENTITLEMENTS" "$APP_DIR" >/dev/null
+codesign -s "$SIGN_IDENTITY" -f "$HELPER_APP" >/dev/null
+codesign -s "$SIGN_IDENTITY" -f --deep --generate-entitlement-der --entitlements "$APP_ENTITLEMENTS" "$APP_DIR" >/dev/null
 
 echo "Built: $APP_DIR"
