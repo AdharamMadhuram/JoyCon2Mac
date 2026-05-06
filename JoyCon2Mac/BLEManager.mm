@@ -532,18 +532,14 @@ waitsForProtocolResponse:(BOOL)waitsForProtocolResponse
             std::cout << "[BLE] " << [[self labelForSide:context.side] UTF8String]
                       << " startup command sequence complete" << std::endl;
             [self emitTelemetry:"init.ready" detail:@"startup command queue drained" forContext:context];
-            if (!context.pairingPersistenceStarted) {
-                context.pairingPersistenceStarted = YES;
-                [self sendPairingPersistenceCommandsToContext:context];
-            }
-            // Emit exactly one confirmation: flip the LED to final pattern.
-            // Removing the duplicate "connected vibration confirm" pulse —
-            // Joy2Win already got a vibration inside initializeIMUForContext,
-            // so doing a second one here makes the controllers buzz twice.
-            [self setPlayerLED:context.ledMask forContext:context label:@"set player LED final"];
-            if (context.commandQueue.count == 0 && !context.commandInFlight) {
-                [self sendNextQueuedCommandForContext:context];
-            }
+            // joycon2cpp does NOT send MAC-binding / pairing-persistence
+            // commands, and doing so right after IMU init was clobbering the
+            // IMU config on the Joy-Con (input packets had a full header +
+            // sticks + buttons + battery but all-zero IMU bytes at 0x30..0x3B).
+            // The LED + vibration inside initializeIMUForContext already
+            // serves as the user-visible "ready" confirmation, so we also
+            // don't need the duplicate "set player LED final".
+            context.pairingPersistenceStarted = YES;
         } else if (!context.commandInFlight &&
                    context.initStarted &&
                    context.isInitialized &&
@@ -677,35 +673,24 @@ waitsForProtocolResponse:(BOOL)waitsForProtocolResponse
     std::cout << "[BLE] Starting startup command sequence for "
               << [[self labelForSide:context.side] UTF8String]
               << " Joy-Con..." << std::endl;
-    [self emitTelemetry:"init.start" detail:@"IMU enable -> LED -> vibration (joycon2cpp order)" forContext:context];
+    [self emitTelemetry:"init.start" detail:@"IMU enable -> 500ms -> IMU enable2 -> 200ms -> LED -> sound" forContext:context];
     [self emitStatus:"initializing" message:"Sending startup commands" forContext:context];
 
-    // Startup order copied from joycon2cpp/testapp/src/testapp.cpp:
-    //   if (player.joycon.writeChar) {
-    //       SendCustomCommands(player.joycon.writeChar);       // IMU enable 0x02 + 0x04
-    //       std::this_thread::sleep_for(200ms);
-    //       SetPlayerLEDs(player.joycon.writeChar, 0x01);      // LED
-    //       EmitSound(player.joycon.writeChar);                // preset-sound vibration
-    //   }
-    // We were doing vibration + LED FIRST and IMU last; if the Joy-Con
-    // rejects something in that early queue, IMU never runs and gyro reads 0.
-    // Putting IMU-enable at the head of the queue guarantees the sensors
-    // stream before we start touching LEDs/haptics.
+    // Send ONLY the first IMU-enable up front. We then schedule the second
+    // IMU-enable 500 ms later (joycon2cpp's SendCustomCommands waits that
+    // long between the two), followed by the LED + vibration 200 ms after
+    // that (joycon2cpp's post-custom-command delay). Packing everything
+    // into the queue with no spacing caused the IMU block in the input
+    // packets to stay all-zero — the controller accepts the first write
+    // but then discards the rest if they arrive too close together.
     [self enqueueCommand:[self dataFromHexString:@"0C91010200040000FF000000"]
                    label:@"imu enable step1 (0x02)"
 waitsForProtocolResponse:NO
                toContext:context];
-    [self enqueueCommand:[self dataFromHexString:@"0C91010400040000FF000000"]
-                   label:@"imu enable step2 (0x04)"
-waitsForProtocolResponse:NO
-               toContext:context];
 
-    // joycon2cpp's 200 ms settle between IMU enable and LED/sound. We run
-    // our queue async on the main runloop so we can't sleep; schedule the
-    // LED + vibration enqueue after a real-time delay instead.
     __weak typeof(self) weakSelf = self;
     __weak JoyConPeripheralContext *weakContext = context;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         typeof(self) strongSelf = weakSelf;
         JoyConPeripheralContext *strongContext = weakContext;
@@ -713,8 +698,21 @@ waitsForProtocolResponse:NO
             strongContext.peripheral.state != CBPeripheralStateConnected) {
             return;
         }
-        [strongSelf setPlayerLED:strongContext.ledMask forContext:strongContext];
-        [strongSelf sendPairingVibrationToContext:strongContext];
+        [strongSelf enqueueCommand:[strongSelf dataFromHexString:@"0C91010400040000FF000000"]
+                             label:@"imu enable step2 (0x04)"
+          waitsForProtocolResponse:NO
+                         toContext:strongContext];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            typeof(self) s = weakSelf;
+            JoyConPeripheralContext *c = weakContext;
+            if (!s || !c || c.peripheral.state != CBPeripheralStateConnected) {
+                return;
+            }
+            [s setPlayerLED:c.ledMask forContext:c];
+            [s sendPairingVibrationToContext:c];
+        });
     });
 }
 
