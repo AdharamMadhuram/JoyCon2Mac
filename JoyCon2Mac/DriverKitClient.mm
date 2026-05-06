@@ -104,36 +104,40 @@
     (void)down;
     (void)left;
     (void)right;
+    // All masks below match joycon2cpp/testapp/src/JoyConDecoder.cpp
+    // (BUTTON_*_MASK_LEFT / _RIGHT). The single ExtractButtonState variant
+    // in JoyConDecoder.cpp already produces the 24-bit state these masks
+    // are designed against.
     uint32_t hidButtons = 0;
-    
-    // Face buttons
+
+    // Face buttons (Right Joy-Con)
     if (rightButtons & 0x000800) hidButtons |= (1 << 0);      // A
     if (rightButtons & 0x000200) hidButtons |= (1 << 1);      // B
     if (rightButtons & 0x000400) hidButtons |= (1 << 2);      // X
     if (rightButtons & 0x000100) hidButtons |= (1 << 3);      // Y
-    
-    // Shoulders
-    if (leftButtons & 0x0040) hidButtons |= (1 << 4);         // L
-    if (rightButtons & 0x004000) hidButtons |= (1 << 5);      // R
-    if (leftButtons & 0x0080) hidButtons |= (1 << 6);         // ZL
-    if (rightButtons & 0x008000) hidButtons |= (1 << 7);      // ZR
-    
-    // System
-    if (leftButtons & 0x0100) hidButtons |= (1 << 8);         // Minus
-    if (rightButtons & 0x000002) hidButtons |= (1 << 9);      // Plus
-    if (leftButtons & 0x2000) hidButtons |= (1 << 12);        // Capture
-    if (rightButtons & 0x000010) hidButtons |= (1 << 13);     // Home
-    
-    // Stick clicks
-    if (leftButtons & 0x0800) hidButtons |= (1 << 10);        // L3
-    if (rightButtons & 0x000004) hidButtons |= (1 << 11);     // R3
 
-    // Side rail buttons. Joy2Win exposes these as R4/R5/L4/L5; keep them as
-    // distinct HID buttons so games can bind them directly.
-    if (rightButtons & 0x001000) hidButtons |= (1 << 14);     // SRR
-    if (rightButtons & 0x002000) hidButtons |= (1 << 15);     // SLR
-    if (leftButtons & 0x0020) hidButtons |= (1 << 16);        // SLL
-    if (leftButtons & 0x0010) hidButtons |= (1 << 17);        // SRL
+    // Shoulders
+    if (leftButtons  & 0x000040) hidButtons |= (1 << 4);      // L  (BUTTON_L_MASK_LEFT)
+    if (rightButtons & 0x004000) hidButtons |= (1 << 5);      // R  (BUTTON_R_MASK_RIGHT)
+    if (leftButtons  & 0x000080) hidButtons |= (1 << 6);      // ZL (trigger bit, left)
+    if (rightButtons & 0x008000) hidButtons |= (1 << 7);      // ZR (trigger bit, right)
+
+    // System
+    if (leftButtons  & 0x000100) hidButtons |= (1 << 8);      // Minus
+    if (rightButtons & 0x000002) hidButtons |= (1 << 9);      // Plus
+    if (leftButtons  & 0x002000) hidButtons |= (1 << 12);     // Capture
+    if (rightButtons & 0x000010) hidButtons |= (1 << 13);     // Home
+
+    // Stick clicks
+    if (leftButtons  & 0x000800) hidButtons |= (1 << 10);     // L3 (BUTTON_STICK_MASK_LEFT)
+    if (rightButtons & 0x000004) hidButtons |= (1 << 11);     // R3 (BUTTON_STICK_MASK_RIGHT)
+
+    // Side rail (SL/SR on each rail). joycon2cpp exposes these as distinct
+    // bits inside the decoded state, so we forward each as its own HID button.
+    if (rightButtons & 0x001000) hidButtons |= (1 << 14);     // SR (right rail)
+    if (rightButtons & 0x002000) hidButtons |= (1 << 15);     // SL (right rail)
+    if (leftButtons  & 0x000020) hidButtons |= (1 << 16);     // SL (left rail)
+    if (leftButtons  & 0x000010) hidButtons |= (1 << 17);     // SR (left rail)
 
     return hidButtons;
 }

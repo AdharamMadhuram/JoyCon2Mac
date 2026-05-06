@@ -244,9 +244,17 @@ private struct StickIndicator: View {
                 Circle()
                     .fill(color)
                     .frame(width: 18, height: 18)
+                    // UI-only axis skew: the decoder emits joycon2cpp's exact
+                    // output (outX = +x*32767, outY = -y*32767). That matches
+                    // the DS4 convention games expect, but against this stick
+                    // visualizer it showed up mirrored — tilting the real
+                    // stick right moved the dot left, and tilting up moved
+                    // it down. Negating both axes here, only in the render,
+                    // lines the dot up with the physical stick without
+                    // disturbing the HID output going to the dext.
                     .offset(
-                        x: CGFloat(x) / 32767 * 42,
-                        y: CGFloat(-y) / 32767 * 42
+                        x: CGFloat(-x) / 32767 * 42,
+                        y: CGFloat(y) / 32767 * 42
                     )
             }
 

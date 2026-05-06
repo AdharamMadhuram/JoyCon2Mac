@@ -109,10 +109,29 @@ void emitDaemonEvent(const char *status, const char *detail) {
 }
 
 void toggleMouseMode() {
-    if (g_mouseEmitter) {
-        g_mouseEmitter.currentMode = (MouseMode)((g_mouseEmitter.currentMode + 1) % 4);
-        const char *modeNames[] = {"OFF", "SLOW", "NORMAL", "FAST"};
-        std::cout << "\n[Mouse Mode] " << modeNames[g_mouseEmitter.currentMode] << "\n";
+    if (!g_mouseEmitter) return;
+
+    // Cycle joycon2cpp-style: OFF -> FAST -> NORMAL -> SLOW -> OFF.
+    g_mouseEmitter.currentMode = (MouseMode)((g_mouseEmitter.currentMode + 1) % 4);
+
+    // Switch the player-LED pattern to mirror the mode, matching
+    // joycon2cpp/testapp/src/testapp.cpp lines 990-1006:
+    //   OFF    -> LED 1 (0x01)
+    //   FAST   -> LED 2 (0x02)
+    //   NORMAL -> LED 3 (0x04)
+    //   SLOW   -> LED 4 (0x08)
+    uint8_t ledPattern = 0x01;
+    const char *modeName = "OFF";
+    switch (g_mouseEmitter.currentMode) {
+        case MouseModeFast:   modeName = "FAST";   ledPattern = 0x02; break;
+        case MouseModeNormal: modeName = "NORMAL"; ledPattern = 0x04; break;
+        case MouseModeSlow:   modeName = "SLOW";   ledPattern = 0x08; break;
+        default: break;
+    }
+    std::cout << "[Mouse Mode] " << modeName << std::endl;
+
+    if (g_bleManager) {
+        [g_bleManager setPlayerLED:ledPattern];
     }
 }
 
@@ -179,8 +198,6 @@ void printDetailedState() {
     
     std::cout << "===================================\n\n";
 }
-
-static uint32_t g_prevButtons = 0;
 
 static uint8_t makeHIDDpad(bool up, bool down, bool left, bool right) {
     if (up && right) return 1;
@@ -254,7 +271,6 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     g_state.lastSide = side;
     g_state.isLeftJoyCon = (side == JoyConSide::Left);
     
-    uint32_t prevButtons = (side == JoyConSide::Left) ? g_state.leftButtons : g_state.rightButtons;
     uint32_t sideButtons = ExtractButtonState(buffer, side);
     if (side == JoyConSide::Left) {
         g_state.leftButtons = sideButtons;
@@ -272,19 +288,36 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     g_state.triggerL = triggers.first;
     g_state.triggerR = triggers.second;
     
-    // Detect Capture button press to toggle mouse mode
-    uint32_t toggleButton = (side == JoyConSide::Left) ? 0x2000 : 0x0040;
-    if ((sideButtons & toggleButton) && !(prevButtons & toggleButton)) {
-        toggleMouseMode();
+    // joycon2cpp: only the Right Joy-Con / Joy-Con 2 has a Chat (C) button,
+    // and that button is the *only* trigger for mouse mode. On the left
+    // Joy-Con we do nothing here — Capture remains a normal gamepad button.
+    if (side == JoyConSide::Right) {
+        static bool wasChatPressed = false;
+        bool chatPressed = (sideButtons & 0x000040) != 0;
+        if (chatPressed && !wasChatPressed) {
+            toggleMouseMode();
+        }
+        wasChatPressed = chatPressed;
     }
-    
-    // Handle mouse mode via DriverKit while continuing to publish gamepad reports.
-    if (g_mouseEmitter && g_mouseEmitter.currentMode != MouseModeOff) {
-        [g_mouseEmitter processOpticalDataX:g_state.mouse.deltaX
-                                          y:g_state.mouse.deltaY
-                                    buttons:sideButtons
-                                       side:side
-                                       joyY:(side == JoyConSide::Left ? g_state.leftStick.y : g_state.rightStick.y)];
+
+    // Mouse mode runs only for Right Joy-Con packets, matching the single-
+    // Joy-Con branch of joycon2cpp/testapp/src/testapp.cpp. For Left we
+    // skip straight to the gamepad report.
+    std::vector<uint8_t> workingBuffer = buffer;
+    if (side == JoyConSide::Right &&
+        g_mouseEmitter &&
+        g_mouseEmitter.currentMode != MouseModeOff) {
+        StickData rStick = g_state.rightStick;
+        [g_mouseEmitter processRightJoyConBuffer:workingBuffer
+                                     buttonState:sideButtons
+                                    stickReading:rStick];
+        // processRightJoyConBuffer zeroed the HID bits it consumed. Re-decode
+        // the gamepad-relevant fields from the modified buffer so the virtual
+        // gamepad doesn't also see the mouse-mode presses.
+        sideButtons       = ExtractButtonState(workingBuffer, JoyConSide::Right);
+        g_state.rightButtons = sideButtons;
+        g_state.rightStick   = DecodeJoystick(workingBuffer, JoyConSide::Right, JoyConOrientation::Upright);
+        g_state.buttons      = sideButtons;
     }
 
     if (g_enableGamepad && g_driverClient) {
@@ -314,8 +347,6 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     } else {
         printControllerState();
     }
-    
-    g_prevButtons = sideButtons;
 }
 
 void printUsage() {
