@@ -167,11 +167,21 @@ static io_service_t copyVirtualJoyConService(void) {
     // are designed against.
     uint32_t hidButtons = 0;
 
-    // Face buttons (Right Joy-Con)
-    if (rightButtons & 0x000800) hidButtons |= (1 << 0);      // A
-    if (rightButtons & 0x000200) hidButtons |= (1 << 1);      // B
-    if (rightButtons & 0x000400) hidButtons |= (1 << 2);      // X
-    if (rightButtons & 0x000100) hidButtons |= (1 << 3);      // Y
+    // Face buttons (Right Joy-Con) — W3C Standard Gamepad positional order.
+    // User confirmed in-game that Circle (bit 1) and Square (bit 2) map
+    // correctly, but Cross (bit 0) and Triangle (bit 3) were swapped —
+    // pressing Nintendo B (bottom) produced PS Cross via position but the
+    // game expected Triangle there, and vice-versa for Nintendo X (top).
+    // So the bottom/top pair is manually inverted relative to the strict
+    // positional mapping:
+    //   buttons[0] = PS Cross    <- Nintendo X (top,    0x000400)
+    //   buttons[1] = PS Circle   <- Nintendo A (right,  0x000800)
+    //   buttons[2] = PS Square   <- Nintendo Y (left,   0x000100)
+    //   buttons[3] = PS Triangle <- Nintendo B (bottom, 0x000200)
+    if (rightButtons & 0x000400) hidButtons |= (1 << 0);      // X (top)    -> Cross
+    if (rightButtons & 0x000800) hidButtons |= (1 << 1);      // A (right)  -> Circle
+    if (rightButtons & 0x000100) hidButtons |= (1 << 2);      // Y (left)   -> Square
+    if (rightButtons & 0x000200) hidButtons |= (1 << 3);      // B (bottom) -> Triangle
 
     // Shoulders
     if (leftButtons  & 0x000040) hidButtons |= (1 << 4);      // L  (BUTTON_L_MASK_LEFT)

@@ -99,12 +99,23 @@ const uint8_t VirtualGamepadDescriptor[] = {
     0x75, 0x04,        //   Report Size (4)
     0x81, 0x03,        //   Input (Const,Var,Abs)
 
-    // Left & Right Sticks (4 axes: X, Y, Z, Rz) - 16 bit
+    // Left & Right Sticks (4 axes: X, Y, Rx, Ry) - 16 bit, signed.
+    //
+    // Axis convention note: Apple's HID stack, Chrome's Gamepad API, Game
+    // Pass, and most generic-gamepad consumers on macOS follow the XInput
+    // convention — X/Y = left stick, *Rx/Ry* = right stick, Z (+ Rz) =
+    // analog triggers. Earlier we used the Sony DualShock convention
+    // (Z/Rz as right stick, Rx/Ry as triggers); that made games read our
+    // right-stick Y bytes as an unused right-trigger axis and left right-
+    // stick up/down dead while left/right happened to line up. Switched
+    // to XInput-style here. The wire layout of JoyConHIDGamepadReport is
+    // unchanged (the 16-bit Z/Rz slots now carry Rx/Ry values), so the
+    // daemon's stickRX/stickRY still map to these fields byte-for-byte.
     0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
     0x09, 0x30,        //   Usage (X)
     0x09, 0x31,        //   Usage (Y)
-    0x09, 0x32,        //   Usage (Z)
-    0x09, 0x35,        //   Usage (Rz)
+    0x09, 0x33,        //   Usage (Rx)
+    0x09, 0x34,        //   Usage (Ry)
     0x16, 0x00, 0x80,  //   Logical Minimum (-32768)
     0x26, 0xFF, 0x7F,  //   Logical Maximum (32767)
     0x36, 0x00, 0x80,  //   Physical Minimum (-32768)
@@ -113,9 +124,10 @@ const uint8_t VirtualGamepadDescriptor[] = {
     0x75, 0x10,        //   Report Size (16)
     0x81, 0x02,        //   Input (Data,Var,Abs)
 
-    // Analog Triggers (Rx, Ry -> L2/R2) - 8 bit
-    0x09, 0x33,        //   Usage (Rx)
-    0x09, 0x34,        //   Usage (Ry)
+    // Analog Triggers (Z, Rz -> L2/R2) - 8 bit. Pairs with the XInput-style
+    // stick mapping above: triggers land on Z/Rz rather than Rx/Ry.
+    0x09, 0x32,        //   Usage (Z)
+    0x09, 0x35,        //   Usage (Rz)
     0x15, 0x00,        //   Logical Minimum (0)
     0x26, 0xFF, 0x00,  //   Logical Maximum (255)
     0x35, 0x00,        //   Physical Minimum (0)

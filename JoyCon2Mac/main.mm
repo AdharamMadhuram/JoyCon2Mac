@@ -449,6 +449,14 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         g_state.leftStick = DecodeJoystick(buffer, JoyConSide::Left, JoyConOrientation::Upright);
     } else {
         g_state.rightButtons = sideButtons;
+        // joycon2cpp's DecodeJoystick picks `&buffer[13]` for the right
+        // Joy-Con — that's where the stick lives in the right's own BLE
+        // packet. Offsets 0x10..0x13 on either Joy-Con carry the optical
+        // mouse delta (see DecodeMouse / GetRawOpticalMouse), so reading
+        // the stick from offset 10 here decodes mouse X/Y raw bytes as a
+        // 12-bit stick — which is why right-stick up/down went dead while
+        // left/right still looked plausible (mouse deltaX jitter survives
+        // the 12-bit unpack, deltaY LSB stays near zero).
         g_state.rightStick = DecodeJoystick(buffer, JoyConSide::Right, JoyConOrientation::Upright);
     }
 
@@ -467,8 +475,15 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     }
     g_state.battery = DecodeBattery(buffer);
     auto triggers = DecodeAnalogTriggers(buffer);
-    g_state.triggerL = triggers.first;
-    g_state.triggerR = triggers.second;
+    // Only update the trigger for the side that sent this packet.
+    // Otherwise a left packet (with 0 at offset 0x3D) would zero out
+    // triggerR on every left-side frame, causing rapid flicker when R
+    // is held on the right Joy-Con.
+    if (side == JoyConSide::Left) {
+        g_state.triggerL = triggers.first;
+    } else {
+        g_state.triggerR = triggers.second;
+    }
     
     // joycon2cpp: only the Right Joy-Con / Joy-Con 2 has a Chat (C) button,
     // and that button is the *only* trigger for mouse mode. On the left
@@ -552,9 +567,9 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
                                                     dpadRight:right];
         report.dpad = makeHIDDpad(up, down, left, right);
         report.stickLX = leftStickForReport.x;
-        report.stickLY = -leftStickForReport.y;
+        report.stickLY = leftStickForReport.y;
         report.stickRX = rightStickForReport.x;
-        report.stickRY = -rightStickForReport.y;
+        report.stickRY = rightStickForReport.y;
         report.triggerL = g_state.triggerL;
         report.triggerR = g_state.triggerR;
 
