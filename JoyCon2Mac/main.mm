@@ -7,6 +7,8 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <climits>
+#include <cstdio>
 #include <signal.h>
 
 // Global state for tracking controller data
@@ -43,6 +45,7 @@ static ControllerState g_state;
 static bool g_showDetailedOutput = false;
 static bool g_emitJSON = false;
 static bool g_enableGamepad = true;
+static bool g_debugInput = false;   // --debug-input: targeted dpad + right-stick trace
 static FILE *g_jsonFile = nullptr;
 static NSDate *g_lastPrintTime = nil;
 static NSDate *g_lastJSONLeftTime = nil;
@@ -447,6 +450,27 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     if (side == JoyConSide::Left) {
         g_state.leftButtons = sideButtons;
         g_state.leftStick = DecodeJoystick(buffer, JoyConSide::Left, JoyConOrientation::Upright);
+
+        // [BLE->DEC L] Fires only when dpad or left-stick bucket actually
+        // changes. dpad bucket = the 4 dpad bits isolated from the rest of
+        // the button word; without this key the log would still fire on
+        // every face-button press and drown out the signal we want.
+        if (g_debugInput) {
+            static uint32_t lastDpadBits = ~0u;
+            static int lastLX = INT32_MAX, lastLY = INT32_MAX;
+            uint32_t dpadBits = sideButtons & 0x00000F; // bits 0..3 = D/U/R/L
+            if (dpadBits != lastDpadBits || g_state.leftStick.x != lastLX || g_state.leftStick.y != lastLY) {
+                bool u = dpadBits & 0x2, d = dpadBits & 0x1, l = dpadBits & 0x8, r = dpadBits & 0x4;
+                fprintf(stderr,
+                        "[BLE->DEC L] btn=0x%06x dpad=%c%c%c%c  LS=(%6d,%6d)\n",
+                        sideButtons,
+                        u ? 'U' : '.', d ? 'D' : '.', l ? 'L' : '.', r ? 'R' : '.',
+                        g_state.leftStick.x, g_state.leftStick.y);
+                lastDpadBits = dpadBits;
+                lastLX = g_state.leftStick.x;
+                lastLY = g_state.leftStick.y;
+            }
+        }
     } else {
         g_state.rightButtons = sideButtons;
         // joycon2cpp's DecodeJoystick picks `&buffer[13]` for the right
@@ -458,6 +482,23 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         // left/right still looked plausible (mouse deltaX jitter survives
         // the 12-bit unpack, deltaY LSB stays near zero).
         g_state.rightStick = DecodeJoystick(buffer, JoyConSide::Right, JoyConOrientation::Upright);
+
+        // [BLE->DEC R] Shows the raw bytes at offsets 13..15 (where the
+        // right stick is packed, 12-bit X | 12-bit Y) alongside the decoded
+        // signed int16 values. If RY stays 0 while RX moves, the mystery
+        // is in the decoder; if RY shows real motion here but is 0
+        // downstream, the mystery is in the HID report path.
+        if (g_debugInput && buffer.size() >= 16) {
+            static int lastRX = INT32_MAX, lastRY = INT32_MAX;
+            if (g_state.rightStick.x != lastRX || g_state.rightStick.y != lastRY) {
+                fprintf(stderr,
+                        "[BLE->DEC R] raw[13..15]=%02x %02x %02x  RS=(%6d,%6d)\n",
+                        buffer[13], buffer[14], buffer[15],
+                        g_state.rightStick.x, g_state.rightStick.y);
+                lastRX = g_state.rightStick.x;
+                lastRY = g_state.rightStick.y;
+            }
+        }
     }
 
     g_state.buttons = sideButtons;
@@ -574,6 +615,43 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         report.triggerR = g_state.triggerR;
 
         [g_driverClient postGamepadReport:report];
+
+        // [HID-TX] Change-triggered trace of exactly what leaves the daemon
+        // for the dext. Prints the 18-bit button word in hex so bits 12..15
+        // (D-pad in the W3C standard mapping) are directly readable, the
+        // hat nibble, all four stick axes, and both analog trigger bytes.
+        // Combined with [BLE->DEC L/R] this tells us whether a missing
+        // input is lost in the decoder, the mapping, or the driver hop.
+        if (g_debugInput) {
+            static uint32_t lastBtn = ~0u;
+            static uint8_t  lastDpad = 0xFF;
+            static int16_t  lastLX = INT16_MIN, lastLY = INT16_MIN;
+            static int16_t  lastRX = INT16_MIN, lastRY = INT16_MIN;
+            static uint8_t  lastTL = 0xFF, lastTR = 0xFF;
+            if (report.buttons != lastBtn || report.dpad != lastDpad
+                || report.stickLX != lastLX || report.stickLY != lastLY
+                || report.stickRX != lastRX || report.stickRY != lastRY
+                || report.triggerL != lastTL || report.triggerR != lastTR) {
+                bool bU = report.buttons & (1u << 12);
+                bool bD = report.buttons & (1u << 13);
+                bool bL = report.buttons & (1u << 14);
+                bool bR = report.buttons & (1u << 15);
+                fprintf(stderr,
+                        "[HID-TX] btn=0x%05x dpadBits=%c%c%c%c hat=%u "
+                        "LS=(%6d,%6d) RS=(%6d,%6d) T=(%3u,%3u)\n",
+                        report.buttons,
+                        bU ? 'U' : '.', bD ? 'D' : '.', bL ? 'L' : '.', bR ? 'R' : '.',
+                        (unsigned)report.dpad,
+                        report.stickLX, report.stickLY,
+                        report.stickRX, report.stickRY,
+                        (unsigned)report.triggerL, (unsigned)report.triggerR);
+                lastBtn = report.buttons;
+                lastDpad = report.dpad;
+                lastLX = report.stickLX; lastLY = report.stickLY;
+                lastRX = report.stickRX; lastRY = report.stickRY;
+                lastTL = report.triggerL; lastTR = report.triggerR;
+            }
+        }
     }
     
     printJSONState(buffer, side, sideButtons);
@@ -635,10 +713,15 @@ int main(int argc, const char * argv[]) {
             }
             else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
             else if (arg == "--no-gamepad") g_enableGamepad = false;
+            else if (arg == "--debug-input") g_debugInput = true;
         }
         
         printUsage();
         emitDaemonEvent("started", "joycon2mac daemon main entered");
+        if (g_debugInput) {
+            fprintf(stderr, "[debug-input] targeted tracing enabled: "
+                            "[BLE->DEC L/R] + [HID-TX] on stderr, change-triggered only\n");
+        }
         
         PairingManager *pairingManager = [PairingManager sharedManager];
         NSString *localMAC = [pairingManager getLocalBluetoothAddress];
