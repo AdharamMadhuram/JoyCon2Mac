@@ -31,6 +31,7 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 @property (nonatomic, assign) uint8_t ledMask;
 @property (nonatomic, assign) NSUInteger inputPacketCount;
 @property (nonatomic, assign) uint8_t currentCommandID;
+@property (nonatomic, assign) BOOL imuAllZeroLastSeen;
 @end
 
 @implementation JoyConPeripheralContext
@@ -40,6 +41,7 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
         _commandQueue = [NSMutableArray array];
         _commandLabels = [NSMutableArray array];
         _commandWaitsForProtocolResponse = [NSMutableArray array];
+        _imuAllZeroLastSeen = YES;
     }
     return self;
 }
@@ -1163,10 +1165,53 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
             _dataCallback(buffer, context.side);
         }
         context.inputPacketCount += 1;
+
+        // Gyro diagnostics path. We want to be able to tell, at a glance,
+        // whether:
+        //   1. The Joy-Con is actually sending >= 0x3C-byte packets
+        //      (header + buttons + sticks + mouse + battery + IMU).
+        //   2. The IMU slice (0x30..0x3B) is literally all zeros — i.e. the
+        //      IMU-enable command never took effect.
+        //   3. The IMU slice has raw values but our decoder is eating them.
+        //
+        // To stay cheap, we only emit once for each distinct "state" of the
+        // IMU slice: first packet, first non-zero IMU, every 600th packet.
         if (context.inputPacketCount <= 5 || context.inputPacketCount % 600 == 0) {
+            NSString *hex = [self hexStringForData:data maxBytes:64];
             [self emitTelemetry:"input.packet"
-                         detail:[NSString stringWithFormat:@"count=%lu length=%lu",
+                         detail:[NSString stringWithFormat:@"count=%lu length=%lu bytes=%@",
                                  (unsigned long)context.inputPacketCount,
+                                 (unsigned long)data.length,
+                                 hex]
+                     forContext:context];
+        }
+
+        if (data.length >= 0x3C) {
+            const uint8_t *b = bytes;
+            int16_t rawAccelX = (int16_t)(b[0x30] | (b[0x31] << 8));
+            int16_t rawAccelY = (int16_t)(b[0x32] | (b[0x33] << 8));
+            int16_t rawAccelZ = (int16_t)(b[0x34] | (b[0x35] << 8));
+            int16_t rawGyroX  = (int16_t)(b[0x36] | (b[0x37] << 8));
+            int16_t rawGyroY  = (int16_t)(b[0x38] | (b[0x39] << 8));
+            int16_t rawGyroZ  = (int16_t)(b[0x3A] | (b[0x3B] << 8));
+            bool imuAllZero = (rawAccelX | rawAccelY | rawAccelZ |
+                               rawGyroX | rawGyroY | rawGyroZ) == 0;
+            if (imuAllZero != context.imuAllZeroLastSeen ||
+                context.inputPacketCount == 1 ||
+                context.inputPacketCount == 60 ||
+                context.inputPacketCount % 600 == 0) {
+                context.imuAllZeroLastSeen = imuAllZero;
+                [self emitTelemetry:"imu.sample"
+                             detail:[NSString stringWithFormat:@"count=%lu allZero=%@ accel=%d,%d,%d gyro=%d,%d,%d",
+                                     (unsigned long)context.inputPacketCount,
+                                     imuAllZero ? @"true" : @"false",
+                                     rawAccelX, rawAccelY, rawAccelZ,
+                                     rawGyroX, rawGyroY, rawGyroZ]
+                         forContext:context];
+            }
+        } else if (context.inputPacketCount <= 5) {
+            [self emitTelemetry:"imu.shortPacket"
+                         detail:[NSString stringWithFormat:@"length=%lu (<0x3C so no IMU slice)",
                                  (unsigned long)data.length]
                      forContext:context];
         }
