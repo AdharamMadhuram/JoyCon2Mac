@@ -135,13 +135,16 @@
           buttonState:(uint32_t)btnState
          stickReading:(StickData)stickData
         mouseDistance:(uint16_t)mouseDistance {
-    if (_currentMode == MouseModeOff) {
-        return NO;
-    }
 
-    // Record this packet's distance into the per-side rolling state so the
-    // Auto picker below (and successive packets) has both sides' recent
-    // surface status available, even though each call only sees one side.
+    // Always record per-side distance + airborne-frame state, even when the
+    // mouse is OFF. Two reasons:
+    //   1. The GUI's "Active" badge (lastActiveSide) needs to reflect the
+    //      real current owner whether or not the pointer is being driven —
+    //      otherwise users see the badge stuck on the init default (Right),
+    //      while the controllers tab clearly shows Left is on a surface.
+    //   2. When the user *does* turn mouse mode on, we want the hysteresis
+    //      counters to already be accurate so the very first packet picks
+    //      the right side instead of taking ~120 ms to catch up.
     if (side == JoyConSide::Left) {
         _lastDistanceLeft = mouseDistance;
         if (mouseDistance == 0) {
@@ -158,45 +161,55 @@
         }
     }
 
-    // Pick the side that "owns" this packet.
-    //
-    // Auto policy (with hysteresis to kill the per-packet ping-pong we saw
-    // when both Joy-Cons sat on the same surface):
-    //   1. If the currently-active side is still on a surface (distance > 0),
-    //      keep it. We only consider switching if it has been airborne for
-    //      several consecutive packets.
-    //   2. If the active side has been airborne for >= AIR_HYST packets AND
-    //      the other side is currently on a surface, switch.
-    //   3. If neither side is on a surface, keep the active side. We do NOT
-    //      process the packet (falls through to the gamepad path); mouse
-    //      movement simply stops until one of the Joy-Cons is set down.
-    //
-    // 8 packets ≈ 120 ms at the ~66 Hz BLE push rate — fast enough that the
-    // handover feels instant, slow enough that a momentary lift (e.g. a
-    // click reaction force making the sensor read 0) doesn't drop the side.
-    static const uint8_t AIR_HYST = 8;
+    // Update `lastActiveSide` in Auto mode so the UI badge is correct
+    // regardless of the mouse emitter's on/off state. With manual Left /
+    // Right, lastActiveSide is already pinned by setSource.
+    if (_source == MouseSourceAuto) {
+        // Whichever side is currently on a surface (airFrames==0 AND
+        // distance>0) owns the pointer. If both are on a surface, prefer
+        // the one we were already using — stickiness kills the per-packet
+        // ping-pong. If neither is on a surface, leave lastActiveSide alone.
+        BOOL leftOn  = (_lastDistanceLeft  > 0) && (_airFramesLeft  == 0);
+        BOOL rightOn = (_lastDistanceRight > 0) && (_airFramesRight == 0);
 
-    JoyConSide activeSide = _lastActiveSide;
-    switch (_source) {
-        case MouseSourceLeft:  activeSide = JoyConSide::Left;  break;
-        case MouseSourceRight: activeSide = JoyConSide::Right; break;
-        case MouseSourceAuto:
-        default: {
-            bool activeIsLeft = (_lastActiveSide == JoyConSide::Left);
+        if (leftOn && !rightOn) {
+            _lastActiveSide = JoyConSide::Left;
+        } else if (rightOn && !leftOn) {
+            _lastActiveSide = JoyConSide::Right;
+        } else if (leftOn && rightOn) {
+            // Both on surface — keep current choice. But if the current
+            // active side has been airborne for HYST packets, we would have
+            // already handed over on a previous packet, so reaching here
+            // means the active side is still healthy.
+            // (no-op)
+        } else {
+            // Neither on a surface. Only hand over once the active side
+            // has clearly been lifted for a sustained window, to avoid
+            // snap-backs when the sensor blips between d=0 and d=1.
+            static const uint8_t AIR_HYST = 8; // ~120 ms at 66 Hz
+            BOOL activeIsLeft = (_lastActiveSide == JoyConSide::Left);
             uint8_t activeAir = activeIsLeft ? _airFramesLeft  : _airFramesRight;
-            uint16_t otherDistance = activeIsLeft ? _lastDistanceRight : _lastDistanceLeft;
-            uint8_t otherAir = activeIsLeft ? _airFramesRight : _airFramesLeft;
-
-            if (activeAir >= AIR_HYST && otherDistance > 0 && otherAir == 0) {
-                // Active side has clearly been lifted and the other one is
-                // currently on a surface. Hand over.
-                activeSide = activeIsLeft ? JoyConSide::Right : JoyConSide::Left;
+            if (activeAir >= AIR_HYST) {
+                // Active side has clearly been lifted. Leave lastActiveSide
+                // where it is — we only switch when the OTHER side lands.
+                // That happens in the leftOn/rightOn branches above when the
+                // next on-surface packet arrives.
             }
-            // Otherwise keep `activeSide == _lastActiveSide`. Both-on-surface
-            // intentionally does NOT trigger a flip.
-            break;
         }
     }
+
+    if (_currentMode == MouseModeOff) {
+        // Emitter is off: surface tracking above keeps the UI badge accurate,
+        // but we don't drive the cursor or consume the packet.
+        return NO;
+    }
+
+    // Resolve the active side for THIS packet's processing using the same
+    // data the badge-update block just refreshed. Manual picks short-circuit
+    // to the forced side.
+    JoyConSide activeSide = _lastActiveSide;
+    if (_source == MouseSourceLeft)  activeSide = JoyConSide::Left;
+    if (_source == MouseSourceRight) activeSide = JoyConSide::Right;
 
     if (side != activeSide) {
         // Not the active side — don't consume the packet. Update the

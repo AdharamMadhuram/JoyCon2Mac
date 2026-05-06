@@ -499,7 +499,11 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
                                         ? g_state.rightStick
                                         : g_state.leftStick;
 
-    if (g_mouseEmitter && g_mouseEmitter.currentMode != MouseModeOff) {
+    // Always feed the emitter — even when mouse mode is Off — so it can
+    // keep its per-side surface tracking up to date and drive the "Active"
+    // badge in the GUI. The emitter short-circuits internally if the mode
+    // is Off (returns NO, buffer untouched) so the gamepad path is unaffected.
+    if (g_mouseEmitter) {
         StickData sideStick = sideStickForGamepad;
         uint16_t sideDistance = (side == JoyConSide::Right)
                                   ? g_state.mouseRight.distance

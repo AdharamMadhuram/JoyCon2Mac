@@ -657,6 +657,26 @@ class DaemonBridge: ObservableObject {
     private var mainApplyScheduled: Bool = false
     private let mainApplyInterval: TimeInterval = 0.05
 
+    // Picker flicker guard. When the user picks a new mouseMode or
+    // mouseSource, the daemon takes up to ~200 ms to read the control file,
+    // apply it, and start echoing the new value in state events. State
+    // packets from before the apply still carry the OLD value, so without
+    // a guard the Picker bounces: user picks Fast -> optimistic UI shows
+    // Fast -> a stale state packet arrives with Slow and overrides it ->
+    // daemon finally applies the command -> state packets now say Fast.
+    //
+    // We keep the pending (user-chosen) value for `pendingEchoWindow`
+    // seconds. Within that window, any incoming state snapshot with a
+    // DIFFERENT value is assumed to be stale and locally overridden to the
+    // pending value before being applied. After the window expires, or as
+    // soon as we see a state packet that matches the pending value, the
+    // guard is released.
+    private var pendingMouseMode: MouseMode?
+    private var pendingMouseModeDeadline: Date?
+    private var pendingMouseSource: MouseSource?
+    private var pendingMouseSourceDeadline: Date?
+    private let pendingEchoWindow: TimeInterval = 0.6
+
     private func scheduleMainApplyLocked() {
         // Called on ingestQueue.
         if mainApplyScheduled { return }
@@ -726,6 +746,38 @@ class DaemonBridge: ObservableObject {
 
         for (_, snapshot) in states {
             var merged = snapshot
+
+            // Flicker guard: if the user just changed mouseMode or
+            // mouseSource, stale state packets still carry the old daemon
+            // value. Override the snapshot's value with the pending choice
+            // until the daemon confirms it or the window expires.
+            let now = Date()
+            if let pending = pendingMouseMode,
+               let deadline = pendingMouseModeDeadline, now < deadline {
+                if merged.mouseMode == pending {
+                    // Daemon just confirmed the change — release guard.
+                    pendingMouseMode = nil
+                    pendingMouseModeDeadline = nil
+                } else {
+                    merged.mouseMode = pending
+                }
+            } else if pendingMouseModeDeadline != nil {
+                pendingMouseMode = nil
+                pendingMouseModeDeadline = nil
+            }
+            if let pending = pendingMouseSource,
+               let deadline = pendingMouseSourceDeadline, now < deadline {
+                if merged.mouseSource == pending {
+                    pendingMouseSource = nil
+                    pendingMouseSourceDeadline = nil
+                } else {
+                    merged.mouseSource = pending
+                }
+            } else if pendingMouseSourceDeadline != nil {
+                pendingMouseSource = nil
+                pendingMouseSourceDeadline = nil
+            }
+
             if let index = updated.firstIndex(where: { $0.id == merged.id }) {
                 if updated[index].status == "ready" { merged.status = "ready" }
                 updated[index] = merged
@@ -758,9 +810,12 @@ class DaemonBridge: ObservableObject {
         // Optimistic UI update so the picker / toggle button shows the new
         // state immediately; the next state event from the daemon will
         // correct it if the command was rejected.
+        let nextMode = MouseMode(rawValue: nextRaw) ?? .off
+        pendingMouseMode = nextMode
+        pendingMouseModeDeadline = Date().addingTimeInterval(pendingEchoWindow)
         if !controllers.isEmpty {
             var updated = controllers
-            updated[0].mouseMode = MouseMode(rawValue: nextRaw) ?? .off
+            updated[0].mouseMode = nextMode
             controllers = updated
             stateRevision &+= 1
         }
@@ -768,9 +823,16 @@ class DaemonBridge: ObservableObject {
 
     func setMouseMode(_ mode: MouseMode) {
         sendControlCommand(["cmd": "setMouseMode", "value": mode.rawValue])
+        // Hold the pending value across stale state echoes so the Picker
+        // doesn't flash back to the previous selection while the daemon
+        // catches up. See pendingEchoWindow for the window length.
+        pendingMouseMode = mode
+        pendingMouseModeDeadline = Date().addingTimeInterval(pendingEchoWindow)
         if !controllers.isEmpty {
             var updated = controllers
-            updated[0].mouseMode = mode
+            for index in updated.indices {
+                updated[index].mouseMode = mode
+            }
             controllers = updated
             stateRevision &+= 1
         }
@@ -778,6 +840,8 @@ class DaemonBridge: ObservableObject {
 
     func setMouseSource(_ source: MouseSource) {
         sendControlCommand(["cmd": "setMouseSource", "value": source.rawValue])
+        pendingMouseSource = source
+        pendingMouseSourceDeadline = Date().addingTimeInterval(pendingEchoWindow)
         if !controllers.isEmpty {
             var updated = controllers
             for index in updated.indices {
