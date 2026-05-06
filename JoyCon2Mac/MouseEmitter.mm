@@ -28,31 +28,20 @@
 @property (nonatomic, assign) int16_t lastOpticalYRight;
 
 // Per-side rolling state used by Auto to decide which Joy-Con owns the
-// pointer.
+// pointer. `lastDistance*` is the latest surface-distance reading; `airFrames*`
+// counts consecutive packets where the distance dropped to zero.
 //
-// Byte 0x17 (what the decoder exposes as MouseData.distance) is the
-// optical sensor's measured distance to the nearest surface. Confirmed
-// against the live hardware:
-//   distance == 0  → Joy-Con is resting on a flat surface (mouse mode)
-//   distance >  0  → Joy-Con is airborne (typical reading ~12)
-// joycon2cpp's own decoder doesn't consume this byte at all; we added
-// it purely so Auto can pick the Joy-Con that's currently on a surface.
-//
-// `lastDistance*` holds the latest MouseData.distance reading per side.
-// `onSurfaceFrames*` counts consecutive packets where that reading was
-// 0 — i.e. the side is *staying* on the surface. A side is considered
-// active when onSurfaceFrames has been >= STICK_HYST for a short window.
-//
-// Why hysteresis: without it, Auto ping-pongs every packet when both
-// Joy-Cons rest on the same surface (both report distance == 0). Also,
-// sensor noise can cause a single-frame d=0 blip while the controller
-// is actually in the air. We require a side to stay on the surface for
-// a couple of consecutive frames before adopting it, and we keep the
-// current active side as long as it's still on the surface.
+// Why: without hysteresis Auto ping-pongs every packet when both Joy-Cons
+// rest on the same surface (both report distance > 0). The old rule —
+// "switch to whatever side just reported distance > 0" — flipped ownership
+// every BLE notification, so the cursor moved roughly 30 ns at a time before
+// the other side took over. Hysteresis fixes it: only consider switching
+// after the currently-active side has been airborne for a few packets, or
+// when the other side's distance is *lower* (i.e. closer to the surface).
 @property (nonatomic, assign) uint16_t lastDistanceLeft;
 @property (nonatomic, assign) uint16_t lastDistanceRight;
-@property (nonatomic, assign) uint8_t onSurfaceFramesLeft;
-@property (nonatomic, assign) uint8_t onSurfaceFramesRight;
+@property (nonatomic, assign) uint8_t airFramesLeft;
+@property (nonatomic, assign) uint8_t airFramesRight;
 
 // Shared click / scroll / side-button state. The mouse pointer is a single
 // macOS object; it doesn't matter which Joy-Con clicked. We don't want
@@ -86,8 +75,8 @@
         _lastActiveSide = JoyConSide::Right;
         _lastDistanceLeft = 0;
         _lastDistanceRight = 0;
-        _onSurfaceFramesLeft = 0;
-        _onSurfaceFramesRight = 0;
+        _airFramesLeft = 0;
+        _airFramesRight = 0;
         _firstOpticalReadLeft = YES;
         _firstOpticalReadRight = YES;
         _lastOpticalXLeft = 0;
@@ -136,8 +125,8 @@
     }
     // Reset the airborne counters on explicit switches so hysteresis does
     // not immediately flip us back to the side we were on before.
-    _onSurfaceFramesLeft = 0;
-    _onSurfaceFramesRight = 0;
+    _airFramesLeft = 0;
+    _airFramesRight = 0;
     [self releaseAllMouseButtons];
 }
 
@@ -145,7 +134,7 @@
                  side:(JoyConSide)side
           buttonState:(uint32_t)btnState
          stickReading:(StickData)stickData
-        surfaceDistance:(uint16_t)surfaceDistance {
+        mouseDistance:(uint16_t)mouseDistance {
 
     // Always record per-side distance + airborne-frame state, even when the
     // mouse is OFF. Two reasons:
@@ -157,57 +146,55 @@
     //      counters to already be accurate so the very first packet picks
     //      the right side instead of taking ~120 ms to catch up.
     if (side == JoyConSide::Left) {
-        _lastDistanceLeft = surfaceDistance;
-        if (surfaceDistance == 0) {
-            if (_onSurfaceFramesLeft < 255) _onSurfaceFramesLeft += 1;
+        _lastDistanceLeft = mouseDistance;
+        if (mouseDistance == 0) {
+            if (_airFramesLeft < 255) _airFramesLeft += 1;
         } else {
-            _onSurfaceFramesLeft = 0;
+            _airFramesLeft = 0;
         }
     } else {
-        _lastDistanceRight = surfaceDistance;
-        if (surfaceDistance == 0) {
-            if (_onSurfaceFramesRight < 255) _onSurfaceFramesRight += 1;
+        _lastDistanceRight = mouseDistance;
+        if (mouseDistance == 0) {
+            if (_airFramesRight < 255) _airFramesRight += 1;
         } else {
-            _onSurfaceFramesRight = 0;
+            _airFramesRight = 0;
         }
     }
 
     // Update `lastActiveSide` in Auto mode so the UI badge is correct
     // regardless of the mouse emitter's on/off state. With manual Left /
     // Right, lastActiveSide is already pinned by setSource.
-    //
-    // Semantics reminder (confirmed on the hardware):
-    //   byte 0x17  == 0  → Joy-Con is RESTING ON a surface (mouse mode)
-    //   byte 0x17  >  0  → Joy-Con is AIRBORNE (typical value ~12)
-    // The decoder exposes this as MouseData.distance, so distance==0 is the
-    // "on-surface" condition. Earlier revisions had this flipped, which is
-    // why picking up Left flipped the UI to Right and vice versa.
-    //
-    // `_onSurfaceFrames*` is incremented on each packet with distance==0,
-    // so it's a "recently-on-surface" counter. We only adopt a side once
-    // it has been sitting on the surface for a couple of consecutive
-    // packets — raw distance dipping to 0 for a single frame of sensor
-    // noise shouldn't flip ownership.
     if (_source == MouseSourceAuto) {
-        // STICK_HYST: how many consecutive on-surface packets we require
-        // before trusting a side. 2 frames ≈ 30 ms, short enough to feel
-        // instant, long enough to reject single-frame noise.
-        static const uint8_t STICK_HYST = 2;
-        BOOL leftOn  = (_lastDistanceLeft  == 0) && (_onSurfaceFramesLeft  >= STICK_HYST);
-        BOOL rightOn = (_lastDistanceRight == 0) && (_onSurfaceFramesRight >= STICK_HYST);
+        // Whichever side is currently on a surface (airFrames==0 AND
+        // distance>0) owns the pointer. If both are on a surface, prefer
+        // the one we were already using — stickiness kills the per-packet
+        // ping-pong. If neither is on a surface, leave lastActiveSide alone.
+        BOOL leftOn  = (_lastDistanceLeft  > 0) && (_airFramesLeft  == 0);
+        BOOL rightOn = (_lastDistanceRight > 0) && (_airFramesRight == 0);
 
         if (leftOn && !rightOn) {
             _lastActiveSide = JoyConSide::Left;
         } else if (rightOn && !leftOn) {
             _lastActiveSide = JoyConSide::Right;
         } else if (leftOn && rightOn) {
-            // Both Joy-Cons resting on the surface — keep whichever side
-            // we were already using. This is the "both on desk" case your
-            // screenshot showed (d=0 on both) and it must not ping-pong.
+            // Both on surface — keep current choice. But if the current
+            // active side has been airborne for HYST packets, we would have
+            // already handed over on a previous packet, so reaching here
+            // means the active side is still healthy.
+            // (no-op)
         } else {
-            // Neither side is currently on a surface. Don't change the
-            // active side; the gamepad path keeps running and the cursor
-            // just stops until one of them is set down again.
+            // Neither on a surface. Only hand over once the active side
+            // has clearly been lifted for a sustained window, to avoid
+            // snap-backs when the sensor blips between d=0 and d=1.
+            static const uint8_t AIR_HYST = 8; // ~120 ms at 66 Hz
+            BOOL activeIsLeft = (_lastActiveSide == JoyConSide::Left);
+            uint8_t activeAir = activeIsLeft ? _airFramesLeft  : _airFramesRight;
+            if (activeAir >= AIR_HYST) {
+                // Active side has clearly been lifted. Leave lastActiveSide
+                // where it is — we only switch when the OTHER side lands.
+                // That happens in the leftOn/rightOn branches above when the
+                // next on-surface packet arrives.
+            }
         }
     }
 

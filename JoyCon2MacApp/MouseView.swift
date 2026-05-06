@@ -130,14 +130,14 @@ struct MouseView: View {
             }
             .pickerStyle(.segmented)
 
-            Text("Auto picks whichever Joy-Con is resting on a surface (distance == 0). Switch sides any time without unpairing — the optical baseline resets on every switch so the cursor won't jump.")
+            Text("Auto picks whichever Joy-Con is resting on a surface (distance > 0). Switch sides any time without unpairing — the optical baseline resets on every switch so the cursor won't jump.")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            // Per-side distance read-out. distance==0 means resting on a
-            // surface, distance>0 means airborne (typical ~12). Auto flips
-            // ownership to whichever has distance == 0 for at least a
-            // couple of consecutive frames.
+            // Per-side surface read-out. distance>0 means the optical
+            // sensor has a surface lock (typical ~12). distance==0 means
+            // the Joy-Con is lifted / no lock. Auto adopts whichever has
+            // distance > 0 consistently.
             HStack(spacing: 14) {
                 surfaceBadge(side: "left", distance: leftController?.mouseDistance ?? 0)
                 surfaceBadge(side: "right", distance: rightController?.mouseDistance ?? 0)
@@ -146,12 +146,11 @@ struct MouseView: View {
     }
 
     private func surfaceBadge(side: String, distance: Int16) -> some View {
-        // Byte 0x17 is the optical sensor distance to the nearest surface:
-        //   distance == 0  → Joy-Con is resting on a flat surface
-        //   distance >  0  → Joy-Con is airborne (typical ~12)
-        // The earlier version had this inverted which made the UI claim the
-        // Joy-Con you were holding in the air was the "on surface" one.
-        let onSurface = distance == 0
+        // Byte 0x17 reads non-zero (~12) when the optical sensor has a
+        // surface lock, and 0 when it can't see a surface. Verified on
+        // hardware: Joy-Con placed on a table reads d=12, lifted reads
+        // d=0.
+        let onSurface = distance > 0
         let isActive = activeSide == side
         return HStack(spacing: 6) {
             Circle()
