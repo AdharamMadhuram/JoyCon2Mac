@@ -8,6 +8,8 @@
 #include <iomanip>
 #include <sstream>
 #include <climits>
+#include <cmath>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <signal.h>
@@ -49,6 +51,11 @@ static bool g_enableGamepad = true;
 static bool g_debugInput = true;    // targeted dpad + right-stick trace, on by default
                                     // (change-triggered — zero output when idle).
                                     // Disable with --no-debug-input.
+static bool g_rightStickAltOffset = false;  // --right-stick-alt: decode right stick
+                                            // from buffer[10..12] instead of [13..15]
+                                            // to test the hypothesis that a single
+                                            // right Joy-Con packet carries its stick
+                                            // at the primary offset.
 static FILE *g_debugInputFile = nullptr;    // mirrors trace lines to a file you can tail
 static FILE *g_jsonFile = nullptr;
 static NSDate *g_lastPrintTime = nil;
@@ -507,18 +514,60 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         // the 12-bit unpack, deltaY LSB stays near zero).
         g_state.rightStick = DecodeJoystick(buffer, JoyConSide::Right, JoyConOrientation::Upright);
 
-        // [BLE->DEC R] Shows the raw bytes at offsets 13..15 (where the
-        // right stick is packed, 12-bit X | 12-bit Y) alongside the decoded
-        // signed int16 values. If RY stays 0 while RX moves, the mystery
-        // is in the decoder; if RY shows real motion here but is 0
-        // downstream, the mystery is in the HID report path.
+        // If --right-stick-alt is set, re-decode the right stick using the
+        // LEFT-stick packet offset (10..12). Same bit-unpacking logic as
+        // joycon2cpp's DecodeJoystick, same centring/deadzone/scale, just
+        // reading from a different buffer slice. Overrides g_state.rightStick
+        // entirely so the full downstream pipeline (HID report, UI JSON,
+        // [HID-TX] trace) sees the alternate decode.
+        if (g_rightStickAltOffset && buffer.size() >= 13) {
+            const uint8_t *d = &buffer[10];
+            int x_raw = ((d[1] & 0x0F) << 8) | d[0];
+            int y_raw = (d[2] << 4) | ((d[1] & 0xF0) >> 4);
+            float x = (x_raw - 2048) / 2048.0f;
+            float y = (y_raw - 2048) / 2048.0f;
+            const float deadzone = 0.08f;
+            if (std::abs(x) < deadzone && std::abs(y) < deadzone) {
+                g_state.rightStick = { 0, 0, 0, 0 };
+            } else {
+                x = std::clamp(x * 1.7f, -1.0f, 1.0f);
+                y = std::clamp(y * 1.7f, -1.0f, 1.0f);
+                g_state.rightStick.x = static_cast<int16_t>(x * 32767);
+                g_state.rightStick.y = static_cast<int16_t>(-y * 32767);
+            }
+        }
+
+        // [BLE->DEC R] The right Joy-Con's packet layout is different from
+        // what joycon2cpp's Windows testapp assumes. testapp uses buffer[13]
+        // because it was decoding Pro-Controller packets where both sticks
+        // share one report (left at [10], right at [13]). But an individual
+        // right Joy-Con's own BLE notification carries ITS ONE STICK at the
+        // primary stick offset [10..12], same as the left Joy-Con does in
+        // its own notification. Reading from [13..15] was grabbing the
+        // neighbouring field (likely mouse/IR telemetry), which is why:
+        //   - resting X was ~0 but resting Y was ~5358 (bias from a
+        //     non-stick field)
+        //   - physical left/right motion produced huge Y swings (the
+        //     neighbouring field happens to vary most on the byte our
+        //     Y-unpack reads)
+        //   - physical up/down motion produced nothing clean on either
+        //     axis
+        // Trace both candidates so we can verify which one actually
+        // tracks the physical stick.
         if (g_debugInput && buffer.size() >= 16) {
             static int lastRX = INT32_MAX, lastRY = INT32_MAX;
             if (g_state.rightStick.x != lastRX || g_state.rightStick.y != lastRY) {
+                // Alt candidate: decode from [10..12] (primary-stick offset).
+                int xAlt = ((buffer[11] & 0x0F) << 8) | buffer[10];
+                int yAlt = (buffer[12] << 4) | ((buffer[11] & 0xF0) >> 4);
                 debugInputLog(
-                        "[BLE->DEC R] raw[13..15]=%02x %02x %02x  RS=(%6d,%6d)\n",
+                        "[BLE->DEC R] raw[13..15]=%02x %02x %02x "
+                        "raw[10..12]=%02x %02x %02x  RS=(%6d,%6d) "
+                        "altXY=(%4d,%4d)\n",
                         buffer[13], buffer[14], buffer[15],
-                        g_state.rightStick.x, g_state.rightStick.y);
+                        buffer[10], buffer[11], buffer[12],
+                        g_state.rightStick.x, g_state.rightStick.y,
+                        xAlt, yAlt);
                 lastRX = g_state.rightStick.x;
                 lastRY = g_state.rightStick.y;
             }
@@ -749,6 +798,7 @@ int main(int argc, const char * argv[]) {
             else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
             else if (arg == "--no-gamepad") g_enableGamepad = false;
             else if (arg == "--no-debug-input") g_debugInput = false;
+            else if (arg == "--right-stick-alt") g_rightStickAltOffset = true;
         }
         
         printUsage();
