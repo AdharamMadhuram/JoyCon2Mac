@@ -331,13 +331,8 @@ OSDictionary * VirtualJoyConGamepadDevice::newDeviceDescription() {
         return nullptr;
     }
 
-    // VID 0x054C (Sony) avoided — Chrome routes it to PlayStation fetcher.
-    // VID 0x057E (Nintendo) avoided — Chrome routes it to Nintendo fetcher
-    //   which only handles known PIDs and drops our custom 0x2066.
-    // Using 0x0F0D (Hori) — a real gamepad vendor Chrome has no special
-    // handling for, so it falls through to the generic HID gamepad path.
-    OSNumber * vendor       = OSNumber::withNumber(static_cast<uint32_t>(0x0F0D), 32); // Hori (generic path)
-    OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x00C1), 32); // custom
+    OSNumber * vendor       = OSNumber::withNumber(static_cast<uint32_t>(0x057E), 32); // Nintendo
+    OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x2066), 32); // Joy-Con 2 pair (custom)
     OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
     OSString * transport    = OSString::withCString("Virtual");
     OSString * manufacturer = OSString::withCString("JoyCon2Mac");
