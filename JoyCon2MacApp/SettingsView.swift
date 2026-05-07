@@ -5,6 +5,7 @@ struct SettingsView: View {
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("autoReconnect") private var autoReconnect = true
     @AppStorage("showNotifications") private var showNotifications = true
+    @AppStorage("sdlOnlyMode") private var sdlOnlyMode = false
     @AppStorage("logLevel") private var logLevel = "Info"
     @AppStorage("deadzone") private var deadzone: Double = 0.08
     @AppStorage("stickSensitivity") private var stickSensitivity: Double = 1.0
@@ -52,6 +53,16 @@ struct SettingsView: View {
             }
 
             Section("Virtual Driver") {
+                Toggle("SDL Only Mode", isOn: Binding(
+                    get: { sdlOnlyMode },
+                    set: { enabled in
+                        sdlOnlyMode = enabled
+                        daemonBridge.setSDLOnlyMode(enabled)
+                        daemonBridge.restartDaemon()
+                    }
+                ))
+                .help("Expose only the DualSense-compatible HID device for SDL/cloud clients")
+
                 SettingsActionRow(
                     icon: "puzzlepiece.extension",
                     title: "System Gamepad and Mouse",
@@ -206,6 +217,7 @@ struct SettingsView: View {
                     "launchAtLogin": launchAtLogin,
                     "autoReconnect": autoReconnect,
                     "showNotifications": showNotifications,
+                    "sdlOnlyMode": sdlOnlyMode,
                     "logLevel": logLevel,
                     "deadzone": deadzone,
                     "stickSensitivity": stickSensitivity
@@ -230,6 +242,8 @@ struct SettingsView: View {
                     launchAtLogin = config["launchAtLogin"] as? Bool ?? false
                     autoReconnect = config["autoReconnect"] as? Bool ?? true
                     showNotifications = config["showNotifications"] as? Bool ?? true
+                    sdlOnlyMode = config["sdlOnlyMode"] as? Bool ?? false
+                    daemonBridge.setSDLOnlyMode(sdlOnlyMode)
                     logLevel = config["logLevel"] as? String ?? "Info"
                     deadzone = config["deadzone"] as? Double ?? 0.08
                     stickSensitivity = config["stickSensitivity"] as? Double ?? 1.0
@@ -264,6 +278,8 @@ struct SettingsView: View {
             launchAtLogin = false
             autoReconnect = true
             showNotifications = true
+            sdlOnlyMode = false
+            daemonBridge.setSDLOnlyMode(false)
             logLevel = "Info"
             deadzone = 0.08
             stickSensitivity = 1.0

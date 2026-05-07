@@ -87,6 +87,10 @@ static io_service_t copyVirtualJoyConService(void) {
 #pragma clang diagnostic pop
 
 - (BOOL)start {
+    return [self startWithSDLOnlyMode:NO];
+}
+
+- (BOOL)startWithSDLOnlyMode:(BOOL)enabled {
     if (_isRunning) return YES;
 
     _service = copyVirtualJoyConService();
@@ -95,7 +99,8 @@ static io_service_t copyVirtualJoyConService(void) {
         return NO;
     }
 
-    kern_return_t ret = IOServiceOpen(_service, mach_task_self(), 0, &_connection);
+    uint32_t type = enabled ? 1 : 0;
+    kern_return_t ret = IOServiceOpen(_service, mach_task_self(), type, &_connection);
     if (ret != KERN_SUCCESS) {
         NSLog(@"[DriverKitClient] ✗ Failed to open connection: 0x%x", ret);
         IOObjectRelease(_service);
@@ -104,7 +109,7 @@ static io_service_t copyVirtualJoyConService(void) {
     }
 
     _isRunning = YES;
-    NSLog(@"[DriverKitClient] ✓ Connected to VirtualJoyConDriver");
+    NSLog(@"[DriverKitClient] ✓ Connected to VirtualJoyConDriver (SDL-only=%d)", enabled);
     return YES;
 }
 
@@ -154,6 +159,35 @@ static io_service_t copyVirtualJoyConService(void) {
         static int errorCount = 0;
         if (errorCount++ % 120 == 0) NSLog(@"[DriverKitClient] Failed to post NFC report: 0x%x", ret);
     }
+}
+
+- (BOOL)copyLatestRumbleReport:(struct JoyConRumbleReportData *)report {
+    if (!_isRunning || _connection == IO_OBJECT_NULL || !report) return NO;
+
+    size_t outputSize = sizeof(*report);
+    kern_return_t ret = IOConnectCallStructMethod(_connection, 3, NULL, 0, report, &outputSize);
+    if (ret != KERN_SUCCESS || outputSize != sizeof(*report)) {
+        static int errorCount = 0;
+        if (errorCount++ % 120 == 0) {
+            NSLog(@"[DriverKitClient] Failed to copy rumble report: 0x%x size=%zu", ret, outputSize);
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)setSDLOnlyMode:(BOOL)enabled {
+    if (!_isRunning || _connection == IO_OBJECT_NULL) return NO;
+
+    struct JoyConHIDModeData mode = {};
+    mode.sdlOnly = enabled ? 1 : 0;
+    size_t outputSize = 0;
+    kern_return_t ret = IOConnectCallStructMethod(_connection, 4, &mode, sizeof(mode), NULL, &outputSize);
+    if (ret != KERN_SUCCESS) {
+        NSLog(@"[DriverKitClient] Failed to set SDL-only mode=%d: 0x%x", enabled, ret);
+        return NO;
+    }
+    return YES;
 }
 
 + (uint32_t)convertButtonsToHID:(uint32_t)leftButtons rightButtons:(uint32_t)rightButtons dpadUp:(BOOL)up dpadDown:(BOOL)down dpadLeft:(BOOL)left dpadRight:(BOOL)right {

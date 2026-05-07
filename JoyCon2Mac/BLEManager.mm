@@ -13,6 +13,7 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 @property (nonatomic, strong) CBCharacteristic *inputCharacteristic;
 @property (nonatomic, strong) CBCharacteristic *commandCharacteristic;
 @property (nonatomic, strong) CBCharacteristic *responseCharacteristic;
+@property (nonatomic, strong) CBCharacteristic *vibrationCharacteristic;
 @property (nonatomic, strong) NSTimer *responseTimer;
 @property (nonatomic, strong) NSMutableArray<NSData *> *commandQueue;
 @property (nonatomic, strong) NSMutableArray<NSString *> *commandLabels;
@@ -32,6 +33,9 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 @property (nonatomic, assign) NSUInteger inputPacketCount;
 @property (nonatomic, assign) uint8_t currentCommandID;
 @property (nonatomic, assign) BOOL imuAllZeroLastSeen;
+@property (nonatomic, assign) uint8_t vibrationCounter;
+@property (nonatomic, assign) uint8_t lastRumbleAmplitude;
+@property (nonatomic, assign) BOOL hasLastRumbleAmplitude;
 @end
 
 @implementation JoyConPeripheralContext
@@ -46,6 +50,31 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
     return self;
 }
 @end
+
+static uint16_t JoyConRumbleAmplitude10Bit(uint8_t amplitude) {
+    if (amplitude == 0) {
+        return 0;
+    }
+    return static_cast<uint16_t>(64 + ((static_cast<uint32_t>(amplitude) * 704 + 127) / 255));
+}
+
+static void FillJoyConVibrationMotorBlock(uint8_t *block, uint8_t counter, uint16_t amplitude) {
+    if (!block || amplitude == 0) {
+        return;
+    }
+
+    const uint16_t frequency0 = 512;
+    const uint16_t frequency1 = 512;
+    uint64_t packed = ((static_cast<uint64_t>(amplitude) & 0x3FF) << 30) |
+                      ((static_cast<uint64_t>(frequency1) & 0x3FF) << 20) |
+                      ((static_cast<uint64_t>(amplitude) & 0x3FF) << 10) |
+                      (static_cast<uint64_t>(frequency0) & 0x3FF);
+
+    block[0] = static_cast<uint8_t>((0x05 << 4) | (counter & 0x0F));
+    for (size_t i = 0; i < 5; i++) {
+        block[i + 1] = static_cast<uint8_t>((packed >> (8 * i)) & 0xFF);
+    }
+}
 
 @implementation BLEManager {
     JoyConDataCallback _dataCallback;
@@ -62,6 +91,10 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
     NSMutableSet<NSString *> *_connectingPeripheralIDs;
     NSMutableArray<NSString *> *_pendingInitializationPeripheralIDs;
     NSString *_startupOwnerPeripheralID;
+    NSTimer *_findTimer;
+    BOOL _findLeftActive;
+    BOOL _findRightActive;
+    NSUInteger _findPhase;
     BOOL _isShuttingDown;
 }
 
@@ -192,6 +225,7 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 - (void)disconnect {
     _isShuttingDown = YES;
     [self emitTelemetry:"daemon.disconnect" detail:@"disconnect requested" side:JoyConSide::Left name:nil];
+    [self setFindModeLeft:NO right:NO];
     [self stopScanning];
     for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
         [context.responseTimer invalidate];
@@ -483,7 +517,8 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
     }
     if ([characteristic isEqual:context.inputCharacteristic] ||
         [characteristic isEqual:context.responseCharacteristic] ||
-        [characteristic isEqual:context.commandCharacteristic]) {
+        [characteristic isEqual:context.commandCharacteristic] ||
+        [characteristic isEqual:context.vibrationCharacteristic]) {
         return context;
     }
     return nil;
@@ -710,6 +745,7 @@ waitsForProtocolResponse:NO
             if (!s || !c || c.peripheral.state != CBPeripheralStateConnected) {
                 return;
             }
+            [s configureVibrationForContext:c];
             [s setPlayerLED:c.ledMask forContext:c];
             [s sendPairingVibrationToContext:c];
         });
@@ -763,6 +799,20 @@ waitsForProtocolResponse:NO
                toContext:context];
 }
 
+- (void)configureVibrationForContext:(JoyConPeripheralContext *)context {
+    uint8_t cmdBytes[] = {
+        0x0A, 0x91, 0x01, 0x08, 0x00, 0x14, 0x00, 0x00,
+        0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    NSData *commandData = [NSData dataWithBytes:cmdBytes length:sizeof(cmdBytes)];
+    [self enqueueCommand:commandData
+                   label:@"configure vibration"
+ waitsForProtocolResponse:NO
+               toContext:context];
+}
+
 - (void)sendPairingVibration {
     for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
         [self sendPairingVibrationToContext:context];
@@ -778,6 +828,151 @@ waitsForProtocolResponse:NO
                    label:label ?: @"connected vibration"
 waitsForProtocolResponse:NO
                toContext:context];
+}
+
+- (NSData *)vibrationPacketForAmplitude:(uint8_t)amplitude counter:(uint8_t)counter {
+    uint8_t packet[42] = {};
+    uint16_t amplitude10Bit = JoyConRumbleAmplitude10Bit(amplitude);
+    if (amplitude10Bit != 0) {
+        FillJoyConVibrationMotorBlock(&packet[1], counter, amplitude10Bit);
+        FillJoyConVibrationMotorBlock(&packet[17], counter, amplitude10Bit);
+    }
+    return [NSData dataWithBytes:packet length:sizeof(packet)];
+}
+
+- (void)sendRumbleAmplitude:(uint8_t)amplitude toContext:(JoyConPeripheralContext *)context {
+    if (!context || !context.characteristicsReady || context.peripheral.state != CBPeripheralStateConnected) {
+        return;
+    }
+    if (context.hasLastRumbleAmplitude && context.lastRumbleAmplitude == amplitude) {
+        return;
+    }
+
+    context.hasLastRumbleAmplitude = YES;
+    context.lastRumbleAmplitude = amplitude;
+
+    if (!context.vibrationCharacteristic) {
+        if (amplitude != 0) {
+            [self sendPairingVibrationToContext:context label:@"rumble fallback sample"];
+        }
+        return;
+    }
+
+    NSData *packet = [self vibrationPacketForAmplitude:amplitude counter:context.vibrationCounter];
+    context.vibrationCounter = (context.vibrationCounter + 1) & 0x0F;
+
+    CBCharacteristicWriteType writeType = CBCharacteristicWriteWithoutResponse;
+    if (!(context.vibrationCharacteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) &&
+        (context.vibrationCharacteristic.properties & CBCharacteristicPropertyWrite)) {
+        writeType = CBCharacteristicWriteWithResponse;
+    }
+
+    [self emitTelemetry:"rumble.write"
+                 detail:[NSString stringWithFormat:@"amplitude=%u counter=%u mode=%@ bytes=%@",
+                         (unsigned)amplitude,
+                         (unsigned)((context.vibrationCounter + 15) & 0x0F),
+                         writeType == CBCharacteristicWriteWithResponse ? @"withResponse" : @"withoutResponse",
+                         [self hexStringForData:packet maxBytes:24]]
+             forContext:context];
+
+    [context.peripheral writeValue:packet
+                 forCharacteristic:context.vibrationCharacteristic
+                              type:writeType];
+}
+
+- (BOOL)findModeActiveForContext:(JoyConPeripheralContext *)context {
+    if (!context) {
+        return NO;
+    }
+    return context.side == JoyConSide::Right ? _findRightActive : _findLeftActive;
+}
+
+- (void)sendFindPulse {
+    static const uint8_t pattern[] = {
+        255, 0, 220, 0,
+        255, 0, 0,   0,
+        170, 0, 255, 0,
+        0,   0, 0,   0
+    };
+    const size_t patternCount = sizeof(pattern) / sizeof(pattern[0]);
+    uint8_t amplitude = pattern[_findPhase % patternCount];
+    _findPhase++;
+
+    for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
+        if ([self findModeActiveForContext:context]) {
+            [self sendRumbleAmplitude:amplitude toContext:context];
+        }
+    }
+}
+
+- (void)startFindTimerIfNeeded {
+    if (_findTimer) {
+        return;
+    }
+    _findPhase = 0;
+    _findTimer = [NSTimer timerWithTimeInterval:0.10
+                                         target:self
+                                       selector:@selector(handleFindTimer:)
+                                       userInfo:nil
+                                        repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:_findTimer forMode:NSRunLoopCommonModes];
+    [self sendFindPulse];
+}
+
+- (void)stopFindTimerIfIdle {
+    if (_findLeftActive || _findRightActive) {
+        return;
+    }
+    [_findTimer invalidate];
+    _findTimer = nil;
+    _findPhase = 0;
+}
+
+- (void)handleFindTimer:(NSTimer *)timer {
+    (void)timer;
+    if (!_findLeftActive && !_findRightActive) {
+        [self stopFindTimerIfIdle];
+        return;
+    }
+    [self sendFindPulse];
+}
+
+- (void)setFindModeLeft:(BOOL)leftActive right:(BOOL)rightActive {
+    BOOL leftChanged = _findLeftActive != leftActive;
+    BOOL rightChanged = _findRightActive != rightActive;
+    _findLeftActive = leftActive;
+    _findRightActive = rightActive;
+
+    if (_findLeftActive || _findRightActive) {
+        [self startFindTimerIfNeeded];
+    } else {
+        [self stopFindTimerIfIdle];
+    }
+
+    if (leftChanged && !leftActive) {
+        for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
+            if (context.side == JoyConSide::Left) {
+                [self sendRumbleAmplitude:0 toContext:context];
+            }
+        }
+    }
+    if (rightChanged && !rightActive) {
+        for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
+            if (context.side == JoyConSide::Right) {
+                [self sendRumbleAmplitude:0 toContext:context];
+            }
+        }
+    }
+}
+
+- (void)setRumbleLowFrequency:(uint8_t)lowFrequency highFrequency:(uint8_t)highFrequency {
+    for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
+        if ([self findModeActiveForContext:context]) {
+            continue;
+        }
+        uint8_t amplitude = context.side == JoyConSide::Right ? highFrequency : lowFrequency;
+        [self sendRumbleAmplitude:amplitude toContext:context];
+    }
 }
 
 - (void)sendPairingPersistenceCommands {
@@ -1100,6 +1295,31 @@ didDiscoverCharacteristicsForService:(CBService *)service
         }
     }
 
+    if (!context.vibrationCharacteristic && context.commandCharacteristic) {
+        NSUInteger commandIndex = [service.characteristics indexOfObject:context.commandCharacteristic];
+        if (commandIndex != NSNotFound && commandIndex > 0) {
+            for (NSInteger i = (NSInteger)commandIndex - 1; i >= 0; i--) {
+                CBCharacteristic *candidate = service.characteristics[(NSUInteger)i];
+                if ([candidate isEqual:context.inputCharacteristic] ||
+                    [candidate isEqual:context.responseCharacteristic] ||
+                    [candidate isEqual:context.commandCharacteristic]) {
+                    continue;
+                }
+                if (candidate.properties & (CBCharacteristicPropertyWriteWithoutResponse | CBCharacteristicPropertyWrite)) {
+                    context.vibrationCharacteristic = candidate;
+                    std::cout << "[BLE] " << [[self labelForSide:context.side] UTF8String]
+                              << " vibration characteristic" << std::endl;
+                    [self emitTelemetry:"characteristic.vibration"
+                                 detail:[NSString stringWithFormat:@"uuid=%@ properties=%@",
+                                         candidate.UUID.UUIDString,
+                                         [self propertiesStringForCharacteristic:candidate]]
+                             forContext:context];
+                    break;
+                }
+            }
+        }
+    }
+
     if (context.inputCharacteristic &&
         context.commandCharacteristic &&
         context.responseCharacteristic &&
@@ -1220,11 +1440,12 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
 didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
              error:(NSError *)error {
     JoyConPeripheralContext *context = [self contextForPeripheral:peripheral];
+    BOOL isCommandWrite = context && [characteristic isEqual:context.commandCharacteristic];
     if (error) {
         NSString *sideLabel = context ? [self labelForSide:context.side] : @"Unknown";
         std::cout << "[BLE] Error writing " << [sideLabel UTF8String]
                   << " characteristic: " << [[error localizedDescription] UTF8String] << std::endl;
-        if (context) {
+        if (context && isCommandWrite) {
             [self emitTelemetry:"command.writeFailed"
                          detail:error.localizedDescription ?: @"GATT write failed"
                      forContext:context];
@@ -1241,7 +1462,7 @@ didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
         return;
     }
 
-    if (context && context.commandInFlight && !context.currentCommandWaitsForProtocolResponse) {
+    if (isCommandWrite && context.commandInFlight && !context.currentCommandWaitsForProtocolResponse) {
         [self emitTelemetry:"command.writeAck" detail:@"CoreBluetooth write-with-response completed" forContext:context];
         [self completeQueuedCommandForContext:context];
     }

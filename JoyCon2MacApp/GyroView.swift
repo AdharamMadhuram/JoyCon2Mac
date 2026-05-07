@@ -22,9 +22,11 @@ import SwiftUI
 // on desk, face up → both sides should read accel ≈ (0, 0, +1 G). If
 // the right reads (0, 0, -1 G), flip the toggle.
 //
-// Gravity frame math (once both sides share a convention):
-//   pitch = atan2(-ax, sqrt(ay² + az²))   (around Y)
-//   roll  = atan2( ay, az)                (around X)
+// Grip-frame display math. In the Joy-Con grip poses we observed, the user's
+// upright/forward tilt lands on the raw Y/Z gravity plane, so the UI presents
+// that as pitch. The raw X tilt is presented as roll.
+//   pitch = atan2( ay, az)
+//   roll  = atan2(-ax, sqrt(ay² + az²))
 //   yaw   = ∫ gz dt                        (around Z, drifts — no mag.)
 
 import simd
@@ -87,30 +89,27 @@ struct GyroView: View {
         case .right: return canonicalRight
         case .fused:
             if let l = canonicalLeft, let r = canonicalRight {
-                // Match joycon2cpp's dual-source rule: average when both
-                // sides have an axis value, but if one side reports zero for
-                // that axis, use the non-zero side. This avoids visibly
-                // halving motion when one Joy-Con's IMU block is briefly
-                // all-zero during startup or recovery.
-                return IMUSample(accel: combineVectors(l.accel, r.accel),
-                                 gyro:  combineVectors(l.gyro,  r.gyro))
+                return combineSamples(l, r)
             }
             return canonicalLeft ?? canonicalRight
         }
     }
 
-    private func combineVectors(_ left: SIMD3<Double>, _ right: SIMD3<Double>) -> SIMD3<Double> {
-        SIMD3(
-            combineComponent(left.x, right.x),
-            combineComponent(left.y, right.y),
-            combineComponent(left.z, right.z)
-        )
+    private func combineSamples(_ left: IMUSample, _ right: IMUSample) -> IMUSample? {
+        let leftValid = hasLiveIMU(left)
+        let rightValid = hasLiveIMU(right)
+
+        if leftValid && rightValid {
+            return IMUSample(accel: (left.accel + right.accel) * 0.5,
+                             gyro:  (left.gyro  + right.gyro)  * 0.5)
+        }
+        if leftValid { return left }
+        if rightValid { return right }
+        return nil
     }
 
-    private func combineComponent(_ left: Double, _ right: Double) -> Double {
-        if left == 0 { return right }
-        if right == 0 { return left }
-        return (left + right) * 0.5
+    private func hasLiveIMU(_ sample: IMUSample) -> Bool {
+        simd_length(sample.accel) > 0.05 || simd_length(sample.gyro) > 0.05
     }
 
     var body: some View {
@@ -179,22 +178,18 @@ struct GyroView: View {
 
     private var sourceAndBars: some View {
         VStack(alignment: .leading, spacing: 18) {
-            // Gyro axis labels in joycon2cpp / canonical frame:
-            //   X → pitch rate (tilt nose up/down)
-            //   Y → roll rate  (tilt side to side)
+            // Gyro axis labels in the grip-frame display convention:
+            //   X → pitch rate (upright/forward tilt)
+            //   Y → roll rate  (side-to-side tilt)
             //   Z → yaw rate   (spin on table)
             VStack(alignment: .leading, spacing: 12) {
                 Text("Gyroscope (°/s) — \(gyroSource.rawValue)")
                     .font(.headline)
                 HStack(spacing: 28) {
-                    // Rate labels match which Euler angle the axis drives:
-                    //   gyroX is angular velocity about body +X → Roll rate
-                    //   gyroY is angular velocity about body +Y → Pitch rate
-                    //   gyroZ is angular velocity about body +Z → Yaw rate
-                    MotionBar(label: "Roll (X)",
+                    MotionBar(label: "Pitch (X)",
                               value: fusedSample?.gyro.x ?? 0,
                               range: -720...720, color: .red)
-                    MotionBar(label: "Pitch (Y)",
+                    MotionBar(label: "Roll (Y)",
                               value: fusedSample?.gyro.y ?? 0,
                               range: -720...720, color: .green)
                     MotionBar(label: "Yaw (Z)",
@@ -358,15 +353,10 @@ private final class OrientationFilter: ObservableObject {
         let gy = abs(sample.gyro.y) < gyroDeadband ? 0 : sample.gyro.y
         let gz = abs(sample.gyro.z) < gyroDeadband ? 0 : sample.gyro.z
 
-        // Integrate gyro rates into the Euler angles they correspond to.
-        // Pitch is rotation about body +Y, so its rate is gyroY.
-        // Roll  is rotation about body +X, so its rate is gyroX.
-        // Yaw   is rotation about body +Z, so its rate is gyroZ.
-        // Earlier revisions swapped X and Y here — pitch was integrating
-        // gyroX and roll was integrating gyroY, which is why tilting the
-        // Joy-Con forward made the model roll and vice versa.
-        let gyroPitch = pitch + gy * dt
-        let gyroRoll  = roll  + gx * dt
+        // Display convention: raw X/Y are preserved, but the grip's
+        // upright/forward tilt is presented as pitch instead of roll.
+        let gyroPitch = pitch + gx * dt
+        let gyroRoll  = roll  + gy * dt
         let gyroYaw   = yaw   + gz * dt
 
         // Long-term pitch/roll: derive from gravity. Skip if the controller
@@ -377,8 +367,8 @@ private final class OrientationFilter: ObservableObject {
         let magnitude = sqrt(ax * ax + ay * ay + az * az)
 
         if magnitude > 0.6 && magnitude < 1.6 {
-            let accPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / .pi
-            let accRoll  = atan2( ay, az) * 180.0 / .pi
+            let accPitch = atan2( ay, az) * 180.0 / .pi
+            let accRoll  = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / .pi
 
             // Wrap-safe complementary blend. Without the shortest-arc
             // correction, a reading like accRoll=+179° combined with

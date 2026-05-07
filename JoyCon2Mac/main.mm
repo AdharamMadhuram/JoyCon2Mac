@@ -7,6 +7,7 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <string>
 #include <climits>
 #include <cmath>
 #include <algorithm>
@@ -48,6 +49,7 @@ static ControllerState g_state;
 static bool g_showDetailedOutput = false;
 static bool g_emitJSON = false;
 static bool g_enableGamepad = true;
+static bool g_sdlOnlyMode = false;
 static bool g_debugInput = true;    // targeted dpad + right-stick trace, on by default
                                     // (change-triggered — zero output when idle).
                                     // Disable with --no-debug-input.
@@ -68,6 +70,18 @@ static BLEManager *g_bleManager = nil;
 static NSString *g_controlFilePath = nil;
 static unsigned long long g_controlFileOffset = 0;
 static dispatch_source_t g_controlFileTimer = nullptr;
+static dispatch_source_t g_rumblePollTimer = nullptr;
+static uint32_t g_lastRumbleSequence = 0;
+static JoyConReportData g_lastGamepadReport = {};
+static bool g_haveLastGamepadReport = false;
+static bool g_findLeftActive = false;
+static bool g_findRightActive = false;
+static int g_findShakeHitsLeft = 0;
+static int g_findShakeHitsRight = 0;
+static std::string g_railBindingLeftSL = "none";
+static std::string g_railBindingLeftSR = "none";
+static std::string g_railBindingRightSL = "none";
+static std::string g_railBindingRightSR = "none";
 
 // Write one formatted debug-input line to stderr AND (if opened) to the
 // mirror file so you can just `tail -f` the file without wrangling the
@@ -86,6 +100,82 @@ static void debugInputLog(const char *fmt, ...) {
         fputs(buf, g_debugInputFile);
         // File is already line-buffered; no need to fflush per line.
     }
+}
+
+static bool unpackStickRaw12(const std::vector<uint8_t>& buffer, JoyConSide side, int& rawX, int& rawY) {
+    if (buffer.size() < 16) {
+        return false;
+    }
+
+    const uint8_t *data = (side == JoyConSide::Left) ? &buffer[10] : &buffer[13];
+    rawX = ((data[1] & 0x0F) << 8) | data[0];
+    rawY = (data[2] << 4) | ((data[1] & 0xF0) >> 4);
+    return true;
+}
+
+static void traceRightStickDecode(const std::vector<uint8_t>& buffer, uint32_t packetCount, const StickData& decoded) {
+    if (!g_debugInput || buffer.size() < 16) {
+        return;
+    }
+
+    int rawX = 0;
+    int rawY = 0;
+    if (!unpackStickRaw12(buffer, JoyConSide::Right, rawX, rawY)) {
+        return;
+    }
+
+    static bool first = true;
+    static int lastRawX = 0;
+    static int lastRawY = 0;
+    static int lastX = 0;
+    static int lastY = 0;
+    if (!first && rawX == lastRawX && rawY == lastRawY && decoded.x == lastX && decoded.y == lastY) {
+        return;
+    }
+
+    int deltaX = first ? 0 : int(decoded.x) - lastX;
+    int deltaY = first ? 0 : int(decoded.y) - lastY;
+    debugInputLog(
+            "[RS-DEC] pkt=%u raw13..15=%02x:%02x:%02x raw12=(%4d,%4d) dec=(%6d,%6d) ddec=(%6d,%6d)\n",
+            packetCount,
+            buffer[13], buffer[14], buffer[15],
+            rawX, rawY,
+            decoded.x, decoded.y,
+            deltaX, deltaY);
+
+    first = false;
+    lastRawX = rawX;
+    lastRawY = rawY;
+    lastX = decoded.x;
+    lastY = decoded.y;
+}
+
+static void traceRightStickTransmit(uint32_t packetCount, JoyConSide side, const JoyConReportData& report) {
+    if (!g_debugInput) {
+        return;
+    }
+
+    static bool first = true;
+    static int lastRX = 0;
+    static int lastRY = 0;
+    if (!first && report.stickRX == lastRX && report.stickRY == lastRY) {
+        return;
+    }
+
+    int deltaX = first ? 0 : int(report.stickRX) - lastRX;
+    int deltaY = first ? 0 : int(report.stickRY) - lastRY;
+    debugInputLog(
+            "[RS-TX]  pkt=%u source=%c reportRS=(%6d,%6d) dtx=(%6d,%6d) pairedLS=(%6d,%6d) T=(%3u,%3u)\n",
+            packetCount,
+            side == JoyConSide::Right ? 'R' : 'L',
+            report.stickRX, report.stickRY,
+            deltaX, deltaY,
+            report.stickLX, report.stickLY,
+            (unsigned)report.triggerL, (unsigned)report.triggerR);
+
+    first = false;
+    lastRX = report.stickRX;
+    lastRY = report.stickRY;
 }
 
 
@@ -186,6 +276,125 @@ void toggleMouseMode() {
     }
 }
 
+static void applySDLOnlyMode(bool enabled) {
+    g_sdlOnlyMode = enabled;
+
+    if (!g_driverClient || !g_driverClient.isRunning) {
+        emitDaemonEvent("sdlOnlyMode", enabled ? "pending=1 driver=missing" : "pending=0 driver=missing");
+        return;
+    }
+
+    BOOL ok = [g_driverClient setSDLOnlyMode:enabled ? YES : NO];
+    if (ok && enabled && g_haveLastGamepadReport) {
+        [g_driverClient postGamepadReport:g_lastGamepadReport];
+    }
+
+    emitDaemonEvent("sdlOnlyMode", ok
+        ? (enabled ? "applied=1" : "applied=0")
+        : (enabled ? "failed=1" : "failed=0"));
+    std::cout << "[Control] SDL Only Mode " << (enabled ? "ON" : "OFF")
+              << (ok ? "" : " (driver rejected)") << std::endl;
+}
+
+static void applyFindJoyConMode(bool leftActive, bool rightActive, const char *reason) {
+    g_findLeftActive = leftActive;
+    g_findRightActive = rightActive;
+    if (!leftActive) g_findShakeHitsLeft = 0;
+    if (!rightActive) g_findShakeHitsRight = 0;
+
+    if (g_bleManager) {
+        [g_bleManager setFindModeLeft:leftActive ? YES : NO
+                                right:rightActive ? YES : NO];
+    }
+
+    NSString *detail = [NSString stringWithFormat:@"left=%d right=%d reason=%s",
+                                                  leftActive ? 1 : 0,
+                                                  rightActive ? 1 : 0,
+                                                  reason ? reason : "unknown"];
+    emitDaemonEvent("findJoyCon", [detail UTF8String]);
+}
+
+static void updateFindShakeStop(JoyConSide side, const MotionData& motion) {
+    bool *active = side == JoyConSide::Right ? &g_findRightActive : &g_findLeftActive;
+    int *hits = side == JoyConSide::Right ? &g_findShakeHitsRight : &g_findShakeHitsLeft;
+    if (!*active) {
+        return;
+    }
+
+    float gyroEnergy = std::fabs(motion.gyroX) + std::fabs(motion.gyroY) + std::fabs(motion.gyroZ);
+    if (gyroEnergy > 180.0f) {
+        (*hits)++;
+    } else if (*hits > 0) {
+        (*hits)--;
+    }
+
+    if (*hits < 5) {
+        return;
+    }
+
+    if (side == JoyConSide::Right) {
+        applyFindJoyConMode(g_findLeftActive, false, "shake-right");
+    } else {
+        applyFindJoyConMode(false, g_findRightActive, "shake-left");
+    }
+}
+
+static std::string sanitizedRailTarget(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return "none";
+    }
+    std::string raw([value UTF8String]);
+    static const char *valid[] = {
+        "none", "cross", "circle", "square", "triangle",
+        "l1", "r1", "l2", "r2",
+        "share", "options", "l3", "r3",
+        "dpadUp", "dpadDown", "dpadLeft", "dpadRight",
+        "home", "capture"
+    };
+    for (const char *target : valid) {
+        if (raw == target) {
+            return raw;
+        }
+    }
+    return "none";
+}
+
+static void applyRailTarget(const std::string& target, uint32_t& leftButtons, uint32_t& rightButtons) {
+    if (target == "cross")         rightButtons |= BTN_RIGHT_X;
+    else if (target == "circle")   rightButtons |= BTN_RIGHT_A;
+    else if (target == "square")   rightButtons |= BTN_RIGHT_Y;
+    else if (target == "triangle") rightButtons |= BTN_RIGHT_B;
+    else if (target == "l1")       leftButtons  |= BTN_LEFT_L;
+    else if (target == "r1")       rightButtons |= BTN_RIGHT_R;
+    else if (target == "l2")       leftButtons  |= BTN_LEFT_ZL;
+    else if (target == "r2")       rightButtons |= BTN_RIGHT_ZR;
+    else if (target == "share")    leftButtons  |= BTN_LEFT_MINUS;
+    else if (target == "options")  rightButtons |= BTN_RIGHT_PLUS;
+    else if (target == "l3")       leftButtons  |= BTN_LEFT_L3;
+    else if (target == "r3")       rightButtons |= BTN_RIGHT_R3;
+    else if (target == "dpadUp")   leftButtons  |= BTN_LEFT_UP;
+    else if (target == "dpadDown") leftButtons  |= BTN_LEFT_DOWN;
+    else if (target == "dpadLeft") leftButtons  |= BTN_LEFT_LEFT;
+    else if (target == "dpadRight") leftButtons |= BTN_LEFT_RIGHT;
+    else if (target == "home")     rightButtons |= BTN_RIGHT_HOME;
+    else if (target == "capture")  leftButtons  |= BTN_LEFT_CAPTURE;
+}
+
+static void applyRailBindingsToReport(uint32_t& leftButtons, uint32_t& rightButtons) {
+    bool leftSLPressed = (leftButtons & BTN_LEFT_SLL) != 0;
+    bool leftSRPressed = (leftButtons & BTN_LEFT_SRL) != 0;
+    bool rightSLPressed = (rightButtons & BTN_RIGHT_SLR) != 0;
+    bool rightSRPressed = (rightButtons & BTN_RIGHT_SRR) != 0;
+
+    leftButtons &= ~(BTN_LEFT_SLL | BTN_LEFT_SRL);
+    rightButtons &= ~(BTN_RIGHT_SLR | BTN_RIGHT_SRR);
+
+    if (leftSLPressed)  applyRailTarget(g_railBindingLeftSL, leftButtons, rightButtons);
+    if (leftSRPressed)  applyRailTarget(g_railBindingLeftSR, leftButtons, rightButtons);
+    if (rightSLPressed) applyRailTarget(g_railBindingRightSL, leftButtons, rightButtons);
+    if (rightSRPressed) applyRailTarget(g_railBindingRightSR, leftButtons, rightButtons);
+}
+
 // Apply one control command from the GUI. Kept as a small dispatch so we
 // can extend it later (rumble trigger, re-pair, etc.) without rewriting
 // the polling loop.
@@ -243,6 +452,25 @@ static void applyControlCommand(NSDictionary *command) {
         emitDaemonEvent("mouseSource",
                         [[NSString stringWithFormat:@"applied=%s (%d)", srcName, raw] UTF8String]);
         std::cout << "[Control] Mouse source set to " << srcName << std::endl;
+    } else if ([cmd isEqualToString:@"setSDLOnlyMode"]) {
+        NSNumber *value = command[@"value"];
+        if (![value isKindOfClass:[NSNumber class]]) return;
+        applySDLOnlyMode(value.boolValue);
+    } else if ([cmd isEqualToString:@"setFindJoyCon"]) {
+        NSNumber *left = command[@"left"];
+        NSNumber *right = command[@"right"];
+        if (![left isKindOfClass:[NSNumber class]] || ![right isKindOfClass:[NSNumber class]]) return;
+        applyFindJoyConMode(left.boolValue, right.boolValue, "command");
+    } else if ([cmd isEqualToString:@"setRailBindings"]) {
+        NSDictionary *bindings = command[@"bindings"];
+        if (![bindings isKindOfClass:[NSDictionary class]]) return;
+
+        g_railBindingLeftSL = sanitizedRailTarget(bindings[@"leftSL"]);
+        g_railBindingLeftSR = sanitizedRailTarget(bindings[@"leftSR"]);
+        g_railBindingRightSL = sanitizedRailTarget(bindings[@"rightSL"]);
+        g_railBindingRightSR = sanitizedRailTarget(bindings[@"rightSR"]);
+
+        emitDaemonEvent("railBindings", "applied=1");
     } else {
         emitDaemonEvent("controlUnknown",
                         [[NSString stringWithFormat:@"unknown cmd=%@", cmd] UTF8String]);
@@ -319,6 +547,48 @@ static void startControlFilePolling(NSString *path) {
     emitDaemonEvent("controlFile", [[NSString stringWithFormat:@"path=%@", path] UTF8String]);
 }
 
+static void pollRumbleReport() {
+    if (!g_driverClient || !g_bleManager) {
+        return;
+    }
+
+    JoyConRumbleReportData report = {};
+    if (![g_driverClient copyLatestRumbleReport:&report]) {
+        return;
+    }
+    if (report.sequence == g_lastRumbleSequence) {
+        return;
+    }
+
+    g_lastRumbleSequence = report.sequence;
+    [g_bleManager setRumbleLowFrequency:report.lowFrequency
+                          highFrequency:report.highFrequency];
+}
+
+static void sendSDLOnlyKeepalive() {
+    if (!g_sdlOnlyMode || !g_enableGamepad || !g_driverClient || !g_haveLastGamepadReport) {
+        return;
+    }
+    [g_driverClient postGamepadReport:g_lastGamepadReport];
+}
+
+static void startRumblePolling() {
+    if (g_rumblePollTimer) {
+        return;
+    }
+
+    dispatch_queue_t queue = dispatch_get_main_queue();
+    g_rumblePollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(g_rumblePollTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 16666667ULL),
+                              16666667ULL,
+                              4000000ULL);
+    dispatch_source_set_event_handler(g_rumblePollTimer, ^{
+        pollRumbleReport();
+        sendSDLOnlyKeepalive();
+    });
+    dispatch_resume(g_rumblePollTimer);
+}
 
 void printControllerState() {
     if (g_emitJSON) {
@@ -504,22 +774,11 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         // See the extended comment in DecodeJoystick for the nibble map.
         g_state.rightStick = DecodeJoystick(buffer, JoyConSide::Right, JoyConOrientation::Upright);
 
-        // [BLE->DEC R] Change-triggered trace of the right Joy-Con stick
-        // decode. Shows the raw nibble group at [13..15] and the decoded
-        // X/Y so we can verify that physical motion maps correctly onto
-        // both axes (earlier the nibble unpack was mirror-imaged to the
-        // left side's, which made physical X drive our Y axis).
-        if (g_debugInput && buffer.size() >= 16) {
-            static int lastRX = INT32_MAX, lastRY = INT32_MAX;
-            if (g_state.rightStick.x != lastRX || g_state.rightStick.y != lastRY) {
-                debugInputLog(
-                        "[BLE->DEC R] raw[13..15]=%02x %02x %02x  RS=(%6d,%6d)\n",
-                        buffer[13], buffer[14], buffer[15],
-                        g_state.rightStick.x, g_state.rightStick.y);
-                lastRX = g_state.rightStick.x;
-                lastRY = g_state.rightStick.y;
-            }
-        }
+        // Right-stick-only trace: raw packet bytes, unpacked 12-bit values,
+        // final decoded stick, and per-line decoded deltas. This is cleaner
+        // than the broad [HID-TX] line when isolating physical right-stick
+        // movement from buttons, left stick, and trigger noise.
+        traceRightStickDecode(buffer, g_state.packetCount, g_state.rightStick);
     }
 
     g_state.buttons = sideButtons;
@@ -528,10 +787,12 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
     // into the right controller's telemetry row and vice versa.
     if (side == JoyConSide::Left) {
         g_state.motionLeft = DecodeMotion(buffer, side);
+        updateFindShakeStop(side, g_state.motionLeft);
         g_state.mouseLeft  = DecodeMouse(buffer);
         g_state.mouse      = g_state.mouseLeft;
     } else {
         g_state.motionRight = DecodeMotion(buffer, side);
+        updateFindShakeStop(side, g_state.motionRight);
         g_state.mouseRight  = DecodeMouse(buffer);
         g_state.mouse       = g_state.mouseRight;
     }
@@ -615,6 +876,8 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
             rightStickForReport   = sideStickForGamepad;
         }
 
+        applyRailBindingsToReport(leftButtonsForReport, rightButtonsForReport);
+
         bool up    = leftButtonsForReport & 0x0002;
         bool down  = leftButtonsForReport & 0x0001;
         bool left  = leftButtonsForReport & 0x0008;
@@ -634,6 +897,8 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         report.stickRY = rightStickForReport.y;
         report.triggerL = g_state.triggerL;
         report.triggerR = g_state.triggerR;
+        g_lastGamepadReport = report;
+        g_haveLastGamepadReport = true;
 
         // Only send a new HID report when something actually changed.
         // Without this gate we fire ~132 reports/sec (66 Hz per side),
@@ -658,9 +923,15 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
             [g_driverClient postGamepadReport:report];
         }
 
+        if (reportChanged) {
+            traceRightStickTransmit(g_state.packetCount, side, report);
+        }
+
         // [HID-TX] Fires only when we actually sent a new report (same
         // gate as the dedup check above). Shows the full button word,
-        // hat, axes, and triggers so you can verify the whole pipeline.
+        // hat, sticks, and triggers so you can verify the whole pipeline.
+        // For right-stick work, grep RS-DEC/RS-TX instead; those lines are
+        // dedicated to the physical right stick and its outgoing report.
         if (g_debugInput && reportChanged) {
             bool bU = report.buttons & (1u << 12);
             bool bD = report.buttons & (1u << 13);
@@ -699,7 +970,12 @@ static void installShutdownHandler(int signalNumber) {
     dispatch_source_set_event_handler(source, ^{
         std::cout << "\n[Daemon] Shutdown requested. Disconnecting Joy-Cons...\n";
         emitDaemonEvent("shutdownRequested", "signal received");
+        if (g_rumblePollTimer) {
+            dispatch_source_cancel(g_rumblePollTimer);
+            g_rumblePollTimer = nullptr;
+        }
         if (g_bleManager) {
+            [g_bleManager setRumbleLowFrequency:0 highFrequency:0];
             [g_bleManager disconnect];
         }
         if (g_driverClient) {
@@ -749,6 +1025,7 @@ int main(int argc, const char * argv[]) {
             else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
             else if (arg == "--no-gamepad") g_enableGamepad = false;
             else if (arg == "--no-debug-input") g_debugInput = false;
+            else if (arg == "--sdl-only") g_sdlOnlyMode = true;
         }
         
         printUsage();
@@ -768,9 +1045,10 @@ int main(int argc, const char * argv[]) {
         
         // Initialize DriverKit client
         g_driverClient = [[DriverKitClient alloc] init];
-        if ([g_driverClient start]) {
+        if ([g_driverClient startWithSDLOnlyMode:g_sdlOnlyMode ? YES : NO]) {
             std::cout << "✓ Connected to DriverKit Extension\n";
             emitDaemonEvent("driverReady", "Connected to VirtualJoyConDriver");
+            applySDLOnlyMode(g_sdlOnlyMode);
         } else {
             std::cout << "✗ Failed to connect to DriverKit Extension\n";
             emitDaemonEvent("driverMissing", "VirtualJoyConDriver not loaded; using CGEvent mouse fallback only");
@@ -791,12 +1069,17 @@ int main(int argc, const char * argv[]) {
         [bleManager setDataCallback:onJoyConData];
         [bleManager setStatusCallback:onJoyConStatus];
         [bleManager setTelemetryCallback:onJoyConTelemetry];
+        startRumblePolling();
         installShutdownHandler(SIGTERM);
         installShutdownHandler(SIGINT);
         
         std::cout << "Waiting for Bluetooth to power on...\n";
         [[NSRunLoop currentRunLoop] run];
         
+        if (g_rumblePollTimer) {
+            dispatch_source_cancel(g_rumblePollTimer);
+            g_rumblePollTimer = nullptr;
+        }
         if (g_driverClient) {
             [g_driverClient stop];
         }

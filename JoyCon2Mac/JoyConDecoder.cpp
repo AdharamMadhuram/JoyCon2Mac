@@ -3,10 +3,61 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <climits>
+#include <cstdlib>
 
 // Helper function to convert two bytes to signed 16-bit integer
 static int16_t to_signed_16(uint8_t lsb, uint8_t msb) {
     return static_cast<int16_t>((msb << 8) | lsb);
+}
+
+struct StickCalibration {
+    int centerX = 2048;
+    int centerY = 2048;
+    int lastRawX = INT_MIN;
+    int lastRawY = INT_MIN;
+    int stableSamples = 0;
+    long long stableSumX = 0;
+    long long stableSumY = 0;
+    bool calibrated = false;
+};
+
+static bool rawLooksLikeNeutral(int raw) {
+    return raw >= 1500 && raw <= 2300;
+}
+
+static bool updateStickCalibration(StickCalibration& calibration, int rawX, int rawY) {
+    bool plausibleNeutral = rawLooksLikeNeutral(rawX) && rawLooksLikeNeutral(rawY);
+    bool stable = plausibleNeutral &&
+        (calibration.lastRawX == INT_MIN ||
+         (std::abs(rawX - calibration.lastRawX) <= 4 &&
+          std::abs(rawY - calibration.lastRawY) <= 4));
+
+    calibration.lastRawX = rawX;
+    calibration.lastRawY = rawY;
+
+    if (!stable) {
+        calibration.stableSamples = 0;
+        calibration.stableSumX = 0;
+        calibration.stableSumY = 0;
+        return calibration.calibrated;
+    }
+
+    calibration.stableSamples++;
+    calibration.stableSumX += rawX;
+    calibration.stableSumY += rawY;
+
+    static const int CAL_SAMPLES = 30;
+    if (calibration.stableSamples >= CAL_SAMPLES) {
+        calibration.centerX = static_cast<int>(calibration.stableSumX / calibration.stableSamples);
+        calibration.centerY = static_cast<int>(calibration.stableSumY / calibration.stableSamples);
+        calibration.calibrated = true;
+        calibration.stableSamples = 0;
+        calibration.stableSumX = 0;
+        calibration.stableSumY = 0;
+    }
+
+    return calibration.calibrated;
 }
 
 uint32_t ExtractButtonState(const std::vector<uint8_t>& buffer) {
@@ -45,39 +96,20 @@ StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, Jo
     int x_raw = ((data[1] & 0x0F) << 8) | data[0];
     int y_raw = (data[2] << 4) | ((data[1] & 0xF0) >> 4);
 
-    // Per-controller auto-calibration: average the first 30 packets to
-    // find the true resting center, then subtract it before normalizing.
-    // joycon2cpp on Windows skips this because ViGEm/XInput handles it,
-    // but on macOS the raw 12-bit values have a per-unit offset (e.g.
-    // y_raw=1866 at rest instead of 2048) that leaks through the deadzone
-    // and registers as a constant stick push in games.
-    static int leftCenterX = 2048, leftCenterY = 2048;
-    static int rightCenterX = 2048, rightCenterY = 2048;
-    static int leftCalSamples = 0, rightCalSamples = 0;
-    static long long leftSumX = 0, leftSumY = 0;
-    static long long rightSumX = 0, rightSumY = 0;
-    static const int CAL_SAMPLES = 30;
+    // Per-controller auto-calibration: only accept a center after the raw
+    // stick stays still inside the normal neutral band. The old "first 30
+    // packets always win" path could poison the cached center if the daemon
+    // restarted while a stick was held, which showed up as permanent drift.
+    static StickCalibration leftCalibration;
+    static StickCalibration rightCalibration;
+    StickCalibration& calibration = isLeft ? leftCalibration : rightCalibration;
 
-    int &centerX = isLeft ? leftCenterX : rightCenterX;
-    int &centerY = isLeft ? leftCenterY : rightCenterY;
-    int &calSamples = isLeft ? leftCalSamples : rightCalSamples;
-    long long &sumX = isLeft ? leftSumX : rightSumX;
-    long long &sumY = isLeft ? leftSumY : rightSumY;
-
-    if (calSamples < CAL_SAMPLES) {
-        sumX += x_raw;
-        sumY += y_raw;
-        calSamples++;
-        if (calSamples == CAL_SAMPLES) {
-            centerX = (int)(sumX / CAL_SAMPLES);
-            centerY = (int)(sumY / CAL_SAMPLES);
-        }
-        // During calibration, return zero so the stick doesn't drift.
+    if (!updateStickCalibration(calibration, x_raw, y_raw)) {
         return { 0, 0, 0, 0 };
     }
 
-    float x = (x_raw - centerX) / 2048.0f;
-    float y = (y_raw - centerY) / 2048.0f;
+    float x = (x_raw - calibration.centerX) / 2048.0f;
+    float y = (y_raw - calibration.centerY) / 2048.0f;
 
     if (!upright) {
         float tx = x, ty = y;

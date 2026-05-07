@@ -123,6 +123,8 @@ class DaemonBridge: ObservableObject {
     // packet firehose now; only on driver-install result.
     @Published var driverInstallStatus: String = ""
     @Published var stateRevision: UInt64 = 0
+    @Published var findingLeftJoyCon = false
+    @Published var findingRightJoyCon = false
 
     // Background queue that owns parsing, file tailing, and throttling.
     // Nothing on this queue touches @Published state directly.
@@ -262,7 +264,11 @@ class DaemonBridge: ObservableObject {
         }
 
         process.executableURL = daemonPath
-        process.arguments = ["--json"]
+        var processArguments = ["--json"]
+        if UserDefaults.standard.bool(forKey: "sdlOnlyMode") {
+            processArguments.append("--sdl-only")
+        }
+        process.arguments = processArguments
         process.standardOutput = pipe
         process.standardError = pipe
 
@@ -306,6 +312,9 @@ class DaemonBridge: ObservableObject {
             daemonProcess = process
             outputPipe = pipe
             isDaemonRunning = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.sendStoredRailBindings()
+            }
         } catch {
             TelemetryStore.shared.append("Failed to start daemon: \(error)")
         }
@@ -376,11 +385,15 @@ class DaemonBridge: ObservableObject {
             // mirrors to ~/Library/Application Support/JoyCon2Mac/input-trace.log
             // so you can just `tail -f` that file while playing. To turn it
             // off: edit the daemon args below and add "--no-debug-input".
-            configuration.arguments = [
+            var arguments = [
                 "--json",
                 "--json-file", logPath.path,
                 "--control-file", controlPath.path
             ]
+            if UserDefaults.standard.bool(forKey: "sdlOnlyMode") {
+                arguments.append("--sdl-only")
+            }
+            configuration.arguments = arguments
 
             isDaemonRunning = true
             startLogPolling()
@@ -597,6 +610,12 @@ class DaemonBridge: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 if status == "started" { self?.isDaemonRunning = true }
                 else if status == "exiting" { self?.isDaemonRunning = false }
+                else if status == "findJoyCon" { self?.applyFindStatus(detail) }
+                else if status == "controlFile" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        self?.sendStoredRailBindings()
+                    }
+                }
             }
         case "telemetry":
             let side = stringValue(object["side"], default: "left")
@@ -610,15 +629,15 @@ class DaemonBridge: ObservableObject {
             scheduleMainApplyLocked()
         case "state":
             let snapshot = buildControllerState(from: object)
-            // [UI R]/[UI L] — what the GUI just ingested and will render.
+            // [RS-UI]/[UI L] — what the GUI just ingested and will render.
             // Change-triggered so idle frames don't spam the log. Compared
-            // against [BLE->DEC R/L] (daemon decoder output) and [HID-TX]
-            // (what got shipped to the HID driver), it pinpoints where a
+            // against [RS-DEC]/[UI L] (daemon decoder output) and [RS-TX]
+            // (what got shipped toward the HID driver), it pinpoints where a
             // missing input is lost: decoder, IPC/JSON, UI, or dext.
             if snapshot.side == "right" {
                 if snapshot.rightStickX != lastTraceRightX || snapshot.rightStickY != lastTraceRightY {
                     writeTrace(String(
-                        format: "[UI R] RS=(%6d,%6d) LS=(%6d,%6d) btn=0x%06x",
+                        format: "[RS-UI] RS=(%6d,%6d) LS=(%6d,%6d) btn=0x%06x",
                         snapshot.rightStickX, snapshot.rightStickY,
                         snapshot.leftStickX, snapshot.leftStickY,
                         snapshot.buttons))
@@ -932,6 +951,48 @@ class DaemonBridge: ObservableObject {
             }
             controllers = updated
             stateRevision &+= 1
+        }
+    }
+
+    func setSDLOnlyMode(_ enabled: Bool) {
+        sendControlCommand(["cmd": "setSDLOnlyMode", "value": enabled ? 1 : 0])
+    }
+
+    func setFindJoyCon(left: Bool, right: Bool) {
+        findingLeftJoyCon = left
+        findingRightJoyCon = right
+        sendControlCommand([
+            "cmd": "setFindJoyCon",
+            "left": left ? 1 : 0,
+            "right": right ? 1 : 0
+        ])
+    }
+
+    func setRailBindings(_ bindings: [String: String]) {
+        sendControlCommand(["cmd": "setRailBindings", "bindings": bindings])
+    }
+
+    private func sendStoredRailBindings() {
+        let defaults = UserDefaults.standard
+        setRailBindings([
+            "leftSL": defaults.string(forKey: "railBinding.leftSL") ?? "none",
+            "leftSR": defaults.string(forKey: "railBinding.leftSR") ?? "none",
+            "rightSL": defaults.string(forKey: "railBinding.rightSL") ?? "none",
+            "rightSR": defaults.string(forKey: "railBinding.rightSR") ?? "none"
+        ])
+    }
+
+    private func applyFindStatus(_ detail: String) {
+        let pairs = detail.split(separator: " ").reduce(into: [String: String]()) { result, token in
+            let parts = token.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { return }
+            result[String(parts[0])] = String(parts[1])
+        }
+        if let left = pairs["left"] {
+            findingLeftJoyCon = left == "1"
+        }
+        if let right = pairs["right"] {
+            findingRightJoyCon = right == "1"
         }
     }
 

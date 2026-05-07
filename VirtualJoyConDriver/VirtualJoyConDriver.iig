@@ -31,6 +31,19 @@ struct JoyConNFCReportData {
     uint8_t payload[32]; // Max read size per chunk
 };
 
+struct JoyConRumbleReportData {
+    uint8_t lowFrequency;
+    uint8_t highFrequency;
+    uint8_t active;
+    uint8_t reserved;
+    uint32_t sequence;
+};
+
+struct JoyConHIDModeData {
+    uint8_t sdlOnly;
+    uint8_t reserved[3];
+};
+
 // ---------------------------------------------------------------------------
 // Root IOService
 // ---------------------------------------------------------------------------
@@ -83,6 +96,30 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Virtual DualSense HID Device (created dynamically from the UserClient)
+// ---------------------------------------------------------------------------
+//
+// Exposes a second, Sony-shaped gamepad while leaving the generic JoyCon2Mac
+// gamepad untouched for Chrome's raw Gamepad API path.
+class VirtualJoyConDualSenseDevice : public IOUserHIDDevice
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService * provider) override;
+    virtual kern_return_t Stop(IOService * provider) override;
+
+    virtual OSDictionary * newDeviceDescription() override;
+    virtual OSData * newReportDescriptor() override;
+
+    virtual kern_return_t setReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
+    virtual kern_return_t getReport(IOMemoryDescriptor * report, IOHIDReportType reportType, IOOptionBits options, uint32_t completionTimeout, OSAction * action) override;
+
+    kern_return_t dispatchDualSenseReport(JoyConReportData reportData) LOCALONLY;
+};
+
+// ---------------------------------------------------------------------------
 // Virtual Mouse HID Device (created dynamically from the UserClient)
 // ---------------------------------------------------------------------------
 class VirtualJoyConMouseDevice : public IOUserHIDDevice
@@ -111,6 +148,8 @@ class VirtualJoyConUserClient : public IOUserClient
 public:
     virtual bool init() override;
     virtual void free() override;
+
+    void setInitialSDLOnlyMode(bool enabled) LOCALONLY;
 
     virtual kern_return_t Start(IOService * provider) override;
     virtual kern_return_t Stop(IOService * provider) override;

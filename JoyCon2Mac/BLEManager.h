@@ -31,6 +31,8 @@ using JoyConTelemetryCallback = std::function<void(JoyConSide, const char *, con
 - (void)initializeIMU;
 - (void)setPlayerLED:(uint8_t)ledMask;
 - (void)sendPairingVibration;
+- (void)setRumbleLowFrequency:(uint8_t)lowFrequency highFrequency:(uint8_t)highFrequency;
+- (void)setFindModeLeft:(BOOL)leftActive right:(BOOL)rightActive;
 - (void)sendPairingPersistenceCommands;
 
 @end

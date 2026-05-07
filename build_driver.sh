@@ -40,6 +40,7 @@ xcrun --sdk driverkit iig \
 mkdir -p "$GENERATED_DIR/local.joycon2mac.driver"
 cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConDriver.h"
 cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConGamepadDevice.h"
+cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConDualSenseDevice.h"
 cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConMouseDevice.h"
 cp "$GENERATED_DIR/VirtualJoyConDriver.h" "$GENERATED_DIR/local.joycon2mac.driver/VirtualJoyConUserClient.h"
 
@@ -199,6 +200,19 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
                     <string>AppleUserHIDDevice</string>
                     <key>IOUserClass</key>
                     <string>VirtualJoyConGamepadDevice</string>
+                </dict>
+                <key>DualSenseDeviceProperties</key>
+                <dict>
+                    <!--
+                      Second gamepad identity for SDL/GameController clients
+                      that ignore custom virtual HID descriptors but accept
+                      Sony DualSense-class devices. The generic gamepad above
+                      remains published for Chrome's raw Gamepad API path.
+                    -->
+                    <key>IOClass</key>
+                    <string>AppleUserHIDDevice</string>
+                    <key>IOUserClass</key>
+                    <string>VirtualJoyConDualSenseDevice</string>
                 </dict>
                 <key>MouseDeviceProperties</key>
                 <dict>
