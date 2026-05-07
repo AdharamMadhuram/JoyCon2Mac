@@ -51,6 +51,11 @@ static NSString *const UUID_RESPONSE = @"c765a961-d9d8-4d36-a20a-5315b111836a";
 }
 @end
 
+@interface BLEManager ()
+- (void)schedulePairingPersistenceForContext:(JoyConPeripheralContext *)context delay:(NSTimeInterval)delay;
+- (void)sendPairingPersistenceCommandsToContext:(JoyConPeripheralContext *)context;
+@end
+
 static uint16_t JoyConRumbleAmplitude10Bit(uint8_t amplitude) {
     if (amplitude == 0) {
         return 0;
@@ -510,6 +515,36 @@ static void FillJoyConVibrationMotorBlock(uint8_t *block, uint8_t counter, uint1
     });
 }
 
+- (void)schedulePairingPersistenceForContext:(JoyConPeripheralContext *)context delay:(NSTimeInterval)delay {
+    NSString *peripheralID = [[self keyForContext:context] copy];
+    if (!peripheralID || context.pairingPersistenceStarted) {
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JoyConPeripheralContext *liveContext = self->_contextsByPeripheralID[peripheralID];
+        if (!liveContext ||
+            liveContext.pairingPersistenceStarted ||
+            !liveContext.isInitialized ||
+            liveContext.peripheral.state != CBPeripheralStateConnected) {
+            return;
+        }
+
+        if (self->_startupOwnerPeripheralID != nil ||
+            liveContext.commandInFlight ||
+            liveContext.commandQueue.count > 0) {
+            [self emitTelemetry:"pairing.defer"
+                         detail:@"waiting for startup/command queue to go idle"
+                     forContext:liveContext];
+            [self schedulePairingPersistenceForContext:liveContext delay:1.0];
+            return;
+        }
+
+        [self sendPairingPersistenceCommandsToContext:liveContext];
+    });
+}
+
 - (JoyConPeripheralContext *)contextForCharacteristic:(CBCharacteristic *)characteristic peripheral:(CBPeripheral *)peripheral {
     JoyConPeripheralContext *context = [self contextForPeripheral:peripheral];
     if (!context) {
@@ -567,25 +602,13 @@ waitsForProtocolResponse:(BOOL)waitsForProtocolResponse
             std::cout << "[BLE] " << [[self labelForSide:context.side] UTF8String]
                       << " startup command sequence complete" << std::endl;
             [self emitTelemetry:"init.ready" detail:@"startup command queue drained" forContext:context];
-            // joycon2cpp does NOT send MAC-binding / pairing-persistence
-            // commands, and doing so right after IMU init was clobbering the
-            // IMU config on the Joy-Con (input packets had a full header +
-            // sticks + buttons + battery but all-zero IMU bytes at 0x30..0x3B).
-            // The LED + vibration inside initializeIMUForContext already
-            // serves as the user-visible "ready" confirmation, so we also
-            // don't need the duplicate "set player LED final".
-            context.pairingPersistenceStarted = YES;
-        } else if (!context.commandInFlight &&
-                   context.initStarted &&
-                   context.isInitialized &&
-                   !context.startupLifecycleDone &&
-                   context.commandQueue.count == 0) {
             context.startupLifecycleDone = YES;
             [self emitTelemetry:"init.lifecycleReady"
-                         detail:@"pairing persistence and confirmation commands complete"
+                         detail:@"startup complete; pairing persistence deferred"
                      forContext:context];
             [self emitStatus:"ready" message:"Device ready" forContext:context];
             [self releaseStartupSlotForContext:context];
+            [self schedulePairingPersistenceForContext:context delay:1.25];
         }
         return;
     }
@@ -977,19 +1000,28 @@ waitsForProtocolResponse:NO
 
 - (void)sendPairingPersistenceCommands {
     for (JoyConPeripheralContext *context in _contextsByPeripheralID.allValues) {
-        [self sendPairingPersistenceCommandsToContext:context];
+        [self schedulePairingPersistenceForContext:context delay:0.0];
     }
 }
 
 - (void)sendPairingPersistenceCommandsToContext:(JoyConPeripheralContext *)context {
+    if (!context ||
+        context.pairingPersistenceStarted ||
+        !context.isInitialized ||
+        context.peripheral.state != CBPeripheralStateConnected) {
+        return;
+    }
+
     PairingManager *pairingManager = [PairingManager sharedManager];
     NSString *localMAC = [pairingManager getLocalBluetoothAddress];
     if (!localMAC) {
         std::cout << "[BLE] Skipping MAC persistence: local Bluetooth MAC unavailable" << std::endl;
         [self emitTelemetry:"pairing.skip" detail:@"local Bluetooth MAC unavailable" forContext:context];
+        context.pairingPersistenceStarted = YES;
         return;
     }
 
+    context.pairingPersistenceStarted = YES;
     [self emitTelemetry:"pairing.start"
                  detail:[NSString stringWithFormat:@"localMAC=%@", localMAC]
              forContext:context];

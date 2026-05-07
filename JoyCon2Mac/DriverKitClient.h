@@ -16,7 +16,7 @@ struct JoyConReportData {
 };
 
 struct JoyConMouseReportData {
-    uint8_t buttons; // Left=1, Right=2, Middle=4
+    uint8_t buttons; // Left=1, Right=2, Middle=4, Back=8, Forward=16
     int16_t deltaX;
     int16_t deltaY;
     int8_t scroll;

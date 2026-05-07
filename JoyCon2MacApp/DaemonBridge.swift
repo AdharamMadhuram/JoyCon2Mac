@@ -836,7 +836,7 @@ class DaemonBridge: ObservableObject {
                         accelX: 0, accelY: 0, accelZ: 0,
                         mouseX: 0, mouseY: 0, mouseDistance: 0,
                         triggerL: 0, triggerR: 0,
-                        packetCount: 0, mouseMode: .off,
+                        packetCount: 0, mouseMode: .normal,
                         mouseSource: .auto, mouseActiveSide: "right",
                         rssi: 0
                     )

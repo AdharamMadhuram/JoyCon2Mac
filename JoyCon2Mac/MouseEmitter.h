@@ -17,10 +17,9 @@ typedef NS_ENUM(NSInteger, MouseMode) {
 
 // Which Joy-Con drives the mouse. joycon2cpp only implements Right, but the
 // Joy-Con 2 (L) also carries an optical sensor and reports distance at the
-// same packet offset. Auto picks whichever side is currently reading a
-// non-zero distance (i.e. the one resting on a surface), falling back to the
-// last-active side if both are on surfaces and to Right if nothing is
-// readable yet.
+// same packet offset. Auto picks whichever side is currently reading distance
+// zero (resting on a surface), falling back to the last-active side if both are
+// on surfaces.
 typedef NS_ENUM(NSInteger, MouseSource) {
     MouseSourceAuto  = 0,
     MouseSourceLeft  = 1,
@@ -55,6 +54,11 @@ typedef NS_ENUM(NSInteger, MouseSource) {
           buttonState:(uint32_t)btnState
          stickReading:(StickData)stickData
         mouseDistance:(uint16_t)mouseDistance;
+
+// True when mouse mode is enabled and this side is the current on-surface
+// mouse owner. The gamepad path uses this to remove that Joy-Con from the
+// virtual DualSense report until it is lifted again.
+- (BOOL)isSideMouseOwned:(JoyConSide)side;
 
 @end
 

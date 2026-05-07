@@ -155,7 +155,7 @@ cat > "$DEXT_CONTENTS/Info.plist" <<PLIST
           client (IOUserUserClient / VirtualJoyConUserClient). Does NOT
           publish an HID device itself.
         * UserClient holds separate nested gamepad and mouse personalities.
-          This mirrors Karabiner's split keyboard/pointing devices and avoids
+          This mirrors Karabiner's split pointing devices and avoids
           Apple's GameController stack classifying the old composite
           gamepad+mouse descriptor as GCMouse only.
     -->

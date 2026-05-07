@@ -68,7 +68,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         menu.addItem(NSMenuItem(title: "Show Window", action: #selector(togglePopover), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Mouse Mode: Off", action: #selector(toggleMouseMode), keyEquivalent: "m"))
+        menu.addItem(NSMenuItem(title: "Mouse Mode: Normal", action: #selector(toggleMouseMode), keyEquivalent: "m"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         

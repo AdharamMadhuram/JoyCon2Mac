@@ -1,6 +1,8 @@
 #import "MouseEmitter.h"
-#import <ApplicationServices/ApplicationServices.h>
+#include <algorithm>
 #include <cstdlib>
+#include <cmath>
+#include <cstdint>
 
 // Structurally a port of the single-Right-JoyCon mouse handler from
 // joycon2cpp/testapp/src/testapp.cpp, extended so the left Joy-Con 2 can
@@ -26,10 +28,17 @@
 @property (nonatomic, assign) int16_t lastOpticalYLeft;
 @property (nonatomic, assign) int16_t lastOpticalXRight;
 @property (nonatomic, assign) int16_t lastOpticalYRight;
+@property (nonatomic, assign) float pendingMoveX;
+@property (nonatomic, assign) float pendingMoveY;
+@property (nonatomic, assign) float pendingScroll;
+@property (nonatomic, assign) float pointerVelocityX;
+@property (nonatomic, assign) float pointerVelocityY;
+@property (nonatomic, strong) dispatch_queue_t pointerQueue;
+@property (nonatomic, strong) dispatch_source_t pointerTimer;
 
 // Per-side rolling state used by Auto to decide which Joy-Con owns the
 // pointer. `lastDistance*` is the latest surface-distance reading; `airFrames*`
-// counts consecutive packets where the distance dropped to zero.
+// counts consecutive packets where the side is airborne.
 //
 // Why: without hysteresis Auto ping-pongs every packet when both Joy-Cons
 // rest on the same surface (both report distance > 0). The old rule —
@@ -40,6 +49,8 @@
 // when the other side's distance is *lower* (i.e. closer to the surface).
 @property (nonatomic, assign) uint16_t lastDistanceLeft;
 @property (nonatomic, assign) uint16_t lastDistanceRight;
+@property (nonatomic, assign) BOOL hasDistanceLeft;
+@property (nonatomic, assign) BOOL hasDistanceRight;
 @property (nonatomic, assign) uint8_t airFramesLeft;
 @property (nonatomic, assign) uint8_t airFramesRight;
 
@@ -47,22 +58,54 @@
 // macOS object; it doesn't matter which Joy-Con clicked. We don't want
 // clicks to stick down if you switch sides mid-press, so releasing a side
 // releases all sticky state (handled in the Auto-switchover branch).
-@property (nonatomic, assign) float scrollAccumulator;
 @property (nonatomic, assign) BOOL leftBtnPressed;
 @property (nonatomic, assign) BOOL rightBtnPressed;
 @property (nonatomic, assign) BOOL middleBtnPressed;
 @property (nonatomic, assign) BOOL mb4Pressed;
 @property (nonatomic, assign) BOOL mb5Pressed;
+@property (nonatomic, assign) uint8_t hidButtons;
 
 @property (nonatomic, assign) JoyConSide lastActiveSide;
 
-- (void)sendMoveDeltaX:(int)dx deltaY:(int)dy;
-- (void)sendMouseButton:(uint8_t)bit down:(BOOL)down location:(CGPoint)loc;
-- (CGPoint)currentCursor;
-- (void)sendScrollClicks:(int)clicks;
+- (void)sendSmoothedMoveDeltaX:(float)dx deltaY:(float)dy;
+- (void)sendMouseButton:(uint8_t)bit down:(BOOL)down;
+- (void)postMouseReportDeltaX:(int)dx deltaY:(int)dy scroll:(int)scroll;
 - (void)sendXButton:(int)which;
 - (void)releaseAllMouseButtons;
+- (void)resetPointerSmoothing;
+- (void)startPointerTimer;
+- (void)flushPointerSmoothing;
+- (BOOL)isSideOnSurface:(JoyConSide)side;
+- (JoyConSide)resolvedActiveSide;
 @end
+
+static const uint64_t kPointerTimerIntervalNanos = 8333333ULL; // 1 / 120 s
+
+static int RoundedTimerPointerStep(float filtered, float pending) {
+    if (std::fabs(pending) < 0.75f && std::fabs(filtered) < 0.75f) {
+        return 0;
+    }
+
+    int step = static_cast<int>(std::lrintf(filtered));
+    if (step == 0 && std::fabs(pending) >= 1.0f) {
+        step = pending > 0.0f ? 1 : -1;
+    }
+
+    int maxStep = static_cast<int>(std::floor(std::fabs(pending)));
+    maxStep = std::clamp(maxStep, 0, 64);
+    if (maxStep == 0) {
+        return 0;
+    }
+    return std::clamp(step, -maxStep, maxStep);
+}
+
+static int16_t ClampMouseDelta(int value) {
+    return static_cast<int16_t>(std::clamp(value, -32768, 32767));
+}
+
+static int8_t ClampMouseWheel(int value) {
+    return static_cast<int8_t>(std::clamp(value, -127, 127));
+}
 
 @implementation MouseEmitter
 
@@ -70,11 +113,13 @@
     self = [super init];
     if (self) {
         _driverClient = client;
-        _currentMode = MouseModeOff;
+        _currentMode = MouseModeNormal;
         _source = MouseSourceAuto;
         _lastActiveSide = JoyConSide::Right;
         _lastDistanceLeft = 0;
         _lastDistanceRight = 0;
+        _hasDistanceLeft = NO;
+        _hasDistanceRight = NO;
         _airFramesLeft = 0;
         _airFramesRight = 0;
         _firstOpticalReadLeft = YES;
@@ -83,14 +128,27 @@
         _lastOpticalYLeft = 0;
         _lastOpticalXRight = 0;
         _lastOpticalYRight = 0;
-        _scrollAccumulator = 0.0f;
+        _pendingMoveX = 0.0f;
+        _pendingMoveY = 0.0f;
+        _pendingScroll = 0.0f;
+        _pointerVelocityX = 0.0f;
+        _pointerVelocityY = 0.0f;
         _leftBtnPressed = NO;
         _rightBtnPressed = NO;
         _middleBtnPressed = NO;
         _mb4Pressed = NO;
         _mb5Pressed = NO;
+        _hidButtons = 0;
+        [self startPointerTimer];
     }
     return self;
+}
+
+- (void)dealloc {
+    if (_pointerTimer) {
+        dispatch_source_cancel(_pointerTimer);
+        _pointerTimer = nil;
+    }
 }
 
 - (void)setCurrentMode:(MouseMode)currentMode {
@@ -101,7 +159,7 @@
     // teleports across the screen" bug when you toggled OFF -> SLOW).
     _firstOpticalReadLeft = YES;
     _firstOpticalReadRight = YES;
-    _scrollAccumulator = 0.0f;
+    [self resetPointerSmoothing];
     if (currentMode == MouseModeOff) {
         [self releaseAllMouseButtons];
     }
@@ -114,7 +172,7 @@
     // for both sides so we don't compute a stale-vs-fresh delta.
     _firstOpticalReadLeft = YES;
     _firstOpticalReadRight = YES;
-    _scrollAccumulator = 0.0f;
+    [self resetPointerSmoothing];
     // Snap the active side to the picker's choice right away so the GUI's
     // "Active" badge flips the moment the user makes the selection, instead
     // of waiting for the next BLE packet to arrive from the chosen side.
@@ -152,6 +210,7 @@
     // `airFrames*` is "how many consecutive packets have shown this side
     // in the air", so it increments when distance > 0 and resets on 0.
     if (side == JoyConSide::Left) {
+        _hasDistanceLeft = YES;
         _lastDistanceLeft = mouseDistance;
         if (mouseDistance > 0) {
             if (_airFramesLeft < 255) _airFramesLeft += 1;
@@ -159,6 +218,7 @@
             _airFramesLeft = 0;
         }
     } else {
+        _hasDistanceRight = YES;
         _lastDistanceRight = mouseDistance;
         if (mouseDistance > 0) {
             if (_airFramesRight < 255) _airFramesRight += 1;
@@ -176,8 +236,8 @@
         // whichever side is on the surface exclusively; if both are on
         // or neither is, we keep the current choice (stickiness kills
         // the per-packet ping-pong).
-        BOOL leftOn  = (_lastDistanceLeft  == 0) && (_airFramesLeft  == 0);
-        BOOL rightOn = (_lastDistanceRight == 0) && (_airFramesRight == 0);
+        BOOL leftOn  = [self isSideOnSurface:JoyConSide::Left];
+        BOOL rightOn = [self isSideOnSurface:JoyConSide::Right];
 
         if (leftOn && !rightOn) {
             _lastActiveSide = JoyConSide::Left;
@@ -204,13 +264,14 @@
         // but we don't drive the cursor or consume the packet.
         return NO;
     }
+    if (!_driverClient || ![_driverClient isRunning]) {
+        return NO;
+    }
 
     // Resolve the active side for THIS packet's processing using the same
     // data the badge-update block just refreshed. Manual picks short-circuit
     // to the forced side.
-    JoyConSide activeSide = _lastActiveSide;
-    if (_source == MouseSourceLeft)  activeSide = JoyConSide::Left;
-    if (_source == MouseSourceRight) activeSide = JoyConSide::Right;
+    JoyConSide activeSide = [self resolvedActiveSide];
 
     if (side != activeSide) {
         // Not the active side — don't consume the packet. Update the
@@ -224,11 +285,21 @@
         return NO;
     }
 
+    if (![self isSideOnSurface:activeSide]) {
+        if (side == JoyConSide::Left) {
+            _firstOpticalReadLeft = YES;
+        } else {
+            _firstOpticalReadRight = YES;
+        }
+        [self resetPointerSmoothing];
+        [self releaseAllMouseButtons];
+        return NO;
+    }
+
     if (activeSide != _lastActiveSide) {
         // Auto just promoted a different side. Drop any sticky clicks so
         // a press that never released on the old side doesn't leak over.
         [self releaseAllMouseButtons];
-        _scrollAccumulator = 0.0f;
         _lastActiveSide = activeSide;
     }
 
@@ -261,9 +332,11 @@
                 case MouseModeSlow:   sensitivity = 0.3f; break;
                 default: break;
             }
-            int moveX = (int)(dx * sensitivity);
-            int moveY = (int)(dy * sensitivity);
-            [self sendMoveDeltaX:moveX deltaY:moveY];
+            float moveX = dx * sensitivity;
+            float moveY = dy * sensitivity;
+            [self sendSmoothedMoveDeltaX:moveX deltaY:moveY];
+        } else {
+            [self sendSmoothedMoveDeltaX:0.0f deltaY:0.0f];
         }
     }
 
@@ -287,17 +360,16 @@
     BOOL mouseRightNow  = (btnState & rightMask)  != 0;
     BOOL mouseMiddleNow = (btnState & middleMask) != 0;
 
-    CGPoint loc = [self currentCursor];
     if (mouseLeftNow != _leftBtnPressed) {
-        [self sendMouseButton:0x01 down:mouseLeftNow location:loc];
+        [self sendMouseButton:0x01 down:mouseLeftNow];
         _leftBtnPressed = mouseLeftNow;
     }
     if (mouseRightNow != _rightBtnPressed) {
-        [self sendMouseButton:0x02 down:mouseRightNow location:loc];
+        [self sendMouseButton:0x02 down:mouseRightNow];
         _rightBtnPressed = mouseRightNow;
     }
     if (mouseMiddleNow != _middleBtnPressed) {
-        [self sendMouseButton:0x04 down:mouseMiddleNow location:loc];
+        [self sendMouseButton:0x04 down:mouseMiddleNow];
         _middleBtnPressed = mouseMiddleNow;
     }
 
@@ -306,17 +378,18 @@
     if (std::abs((int)stickData.y) > SCROLL_DEADZONE) {
         float intensity = (std::abs((int)stickData.y) - SCROLL_DEADZONE) /
                           (32767.0f - SCROLL_DEADZONE);
-        float speed = intensity * 40.0f;
-        if (stickData.y > 0) _scrollAccumulator -= speed; // Up
-        else                 _scrollAccumulator += speed; // Down
-
-        if (std::fabs(_scrollAccumulator) >= 120.0f) {
-            int clicks = (int)(_scrollAccumulator / 120.0f);
-            _scrollAccumulator -= clicks * 120.0f;
-            [self sendScrollClicks:clicks];
+        float speed = std::pow(intensity, 1.35f) * 34.0f;
+        @synchronized (self) {
+            if (stickData.y > 0) _pendingScroll += speed; // Up
+            else                 _pendingScroll -= speed; // Down
         }
     } else {
-        _scrollAccumulator = 0.0f;
+        @synchronized (self) {
+            _pendingScroll *= 0.72f;
+            if (std::fabs(_pendingScroll) < 1.0f) {
+                _pendingScroll = 0.0f;
+            }
+        }
     }
 
     const int BUTTON_THRESHOLD = 28000;
@@ -373,86 +446,185 @@
     return YES;
 }
 
-// MARK: - CGEvent helpers
+// MARK: - HID mouse helpers
 
-- (CGPoint)currentCursor {
-    CGEventRef e = CGEventCreate(NULL);
-    CGPoint p = e ? CGEventGetLocation(e) : CGPointZero;
-    if (e) CFRelease(e);
-    return p;
+- (JoyConSide)resolvedActiveSide {
+    if (_source == MouseSourceLeft) {
+        return JoyConSide::Left;
+    }
+    if (_source == MouseSourceRight) {
+        return JoyConSide::Right;
+    }
+    return _lastActiveSide;
 }
 
-- (void)sendMoveDeltaX:(int)dx deltaY:(int)dy {
-    if (dx == 0 && dy == 0) return;
-    CGPoint loc = [self currentCursor];
-    CGPoint target = CGPointMake(loc.x + dx, loc.y + dy);
-    CGEventRef ev = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, target, kCGMouseButtonLeft);
-    if (ev) {
-        CGEventPost(kCGHIDEventTap, ev);
-        CFRelease(ev);
+- (BOOL)isSideOnSurface:(JoyConSide)side {
+    if (side == JoyConSide::Left) {
+        return _hasDistanceLeft && _lastDistanceLeft == 0 && _airFramesLeft == 0;
+    }
+    return _hasDistanceRight && _lastDistanceRight == 0 && _airFramesRight == 0;
+}
+
+- (BOOL)isSideMouseOwned:(JoyConSide)side {
+    if (_currentMode == MouseModeOff) {
+        return NO;
+    }
+    if (!_driverClient || ![_driverClient isRunning]) {
+        return NO;
+    }
+    if (side != [self resolvedActiveSide]) {
+        return NO;
+    }
+    return [self isSideOnSurface:side];
+}
+
+- (void)postMouseReportDeltaX:(int)dx deltaY:(int)dy scroll:(int)scroll {
+    if (!_driverClient || ![_driverClient isRunning]) {
+        return;
+    }
+
+    uint8_t buttons = 0;
+    @synchronized (self) {
+        buttons = _hidButtons & 0x1F;
+    }
+
+    struct JoyConMouseReportData report = {};
+    report.buttons = buttons;
+    report.deltaX = ClampMouseDelta(dx);
+    report.deltaY = ClampMouseDelta(dy);
+    report.scroll = ClampMouseWheel(scroll);
+    [_driverClient postMouseReport:report];
+}
+
+- (void)sendSmoothedMoveDeltaX:(float)dx deltaY:(float)dy {
+    if (dx == 0.0f && dy == 0.0f) {
+        return;
+    }
+
+    @synchronized (self) {
+        _pendingMoveX += dx;
+        _pendingMoveY += dy;
     }
 }
 
-- (void)sendMouseButton:(uint8_t)bit down:(BOOL)down location:(CGPoint)loc {
-    CGEventType type;
-    CGMouseButton button = kCGMouseButtonLeft;
-    switch (bit) {
-        case 0x01:
-            type = down ? kCGEventLeftMouseDown : kCGEventLeftMouseUp;
-            button = kCGMouseButtonLeft;
-            break;
-        case 0x02:
-            type = down ? kCGEventRightMouseDown : kCGEventRightMouseUp;
-            button = kCGMouseButtonRight;
-            break;
-        case 0x04:
-        default:
-            type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp;
-            button = kCGMouseButtonCenter;
-            break;
+- (void)startPointerTimer {
+    if (_pointerTimer) {
+        return;
     }
-    CGEventRef ev = CGEventCreateMouseEvent(NULL, type, loc, button);
-    if (ev) {
-        CGEventPost(kCGHIDEventTap, ev);
-        CFRelease(ev);
-    }
+
+    _pointerQueue = dispatch_queue_create("local.joycon2mac.mouse.pointer", DISPATCH_QUEUE_SERIAL);
+    _pointerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _pointerQueue);
+    dispatch_source_set_timer(_pointerTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, kPointerTimerIntervalNanos),
+                              kPointerTimerIntervalNanos,
+                              1000000ULL);
+    __weak MouseEmitter *weakSelf = self;
+    dispatch_source_set_event_handler(_pointerTimer, ^{
+        [weakSelf flushPointerSmoothing];
+    });
+    dispatch_resume(_pointerTimer);
 }
 
-- (void)sendScrollClicks:(int)clicks {
-    if (clicks == 0) return;
-    CGEventRef ev = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitLine, 1, clicks);
-    if (ev) {
-        CGEventPost(kCGHIDEventTap, ev);
-        CFRelease(ev);
+- (void)flushPointerSmoothing {
+    int outX = 0;
+    int outY = 0;
+    int outScroll = 0;
+
+    @synchronized (self) {
+        if (_currentMode == MouseModeOff) {
+            _pendingMoveX = 0.0f;
+            _pendingMoveY = 0.0f;
+            _pendingScroll = 0.0f;
+            _pointerVelocityX = 0.0f;
+            _pointerVelocityY = 0.0f;
+            return;
+        }
+
+        float pendingDistance = std::hypot(_pendingMoveX, _pendingMoveY);
+        if (std::fabs(_pendingScroll) >= 80.0f) {
+            outScroll = static_cast<int>(_pendingScroll / 80.0f);
+            outScroll = std::clamp(outScroll, -3, 3);
+            _pendingScroll -= outScroll * 80.0f;
+        }
+
+        if (pendingDistance < 0.35f &&
+            std::fabs(_pointerVelocityX) < 0.35f &&
+            std::fabs(_pointerVelocityY) < 0.35f &&
+            outScroll == 0) {
+            return;
+        }
+
+        float releaseFactor = 0.34f;
+        if (pendingDistance > 40.0f) {
+            releaseFactor = 0.58f;
+        } else if (pendingDistance > 16.0f) {
+            releaseFactor = 0.48f;
+        } else if (pendingDistance > 5.0f) {
+            releaseFactor = 0.40f;
+        }
+
+        float targetX = _pendingMoveX * releaseFactor;
+        float targetY = _pendingMoveY * releaseFactor;
+        _pointerVelocityX = _pointerVelocityX * 0.26f + targetX * 0.74f;
+        _pointerVelocityY = _pointerVelocityY * 0.26f + targetY * 0.74f;
+
+        outX = RoundedTimerPointerStep(_pointerVelocityX, _pendingMoveX);
+        outY = RoundedTimerPointerStep(_pointerVelocityY, _pendingMoveY);
+        if (outX == 0 && outY == 0 && outScroll == 0) {
+            return;
+        }
+
+        _pendingMoveX -= outX;
+        _pendingMoveY -= outY;
+        _pointerVelocityX -= outX;
+        _pointerVelocityY -= outY;
+    }
+
+    [self postMouseReportDeltaX:outX deltaY:outY scroll:outScroll];
+}
+
+- (void)sendMouseButton:(uint8_t)bit down:(BOOL)down {
+    bit &= 0x1F;
+    uint8_t oldButtons = _hidButtons;
+    if (down) {
+        _hidButtons |= bit;
+    } else {
+        _hidButtons &= ~bit;
+    }
+    if (_hidButtons != oldButtons) {
+        [self postMouseReportDeltaX:0 deltaY:0 scroll:0];
     }
 }
 
 - (void)sendXButton:(int)which {
-    // macOS maps "back" and "forward" side-buttons to button numbers 3 and 4.
-    CGMouseButton button = (which == 1) ? (CGMouseButton)3 : (CGMouseButton)4;
-    CGPoint loc = [self currentCursor];
-    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventOtherMouseDown, loc, button);
-    CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventOtherMouseUp,   loc, button);
-    if (down) { CGEventPost(kCGHIDEventTap, down); CFRelease(down); }
-    if (up)   { CGEventPost(kCGHIDEventTap, up);   CFRelease(up); }
+    uint8_t bit = (which == 1) ? 0x08 : 0x10;
+    uint8_t savedButtons = _hidButtons;
+    _hidButtons = savedButtons | bit;
+    [self postMouseReportDeltaX:0 deltaY:0 scroll:0];
+    _hidButtons = savedButtons;
+    [self postMouseReportDeltaX:0 deltaY:0 scroll:0];
 }
 
 - (void)releaseAllMouseButtons {
-    CGPoint loc = [self currentCursor];
-    if (_leftBtnPressed) {
-        [self sendMouseButton:0x01 down:NO location:loc];
-        _leftBtnPressed = NO;
+    if (_hidButtons != 0) {
+        _hidButtons = 0;
+        [self postMouseReportDeltaX:0 deltaY:0 scroll:0];
     }
-    if (_rightBtnPressed) {
-        [self sendMouseButton:0x02 down:NO location:loc];
-        _rightBtnPressed = NO;
-    }
-    if (_middleBtnPressed) {
-        [self sendMouseButton:0x04 down:NO location:loc];
-        _middleBtnPressed = NO;
-    }
+    _leftBtnPressed = NO;
+    _rightBtnPressed = NO;
+    _middleBtnPressed = NO;
     _mb4Pressed = NO;
     _mb5Pressed = NO;
+}
+
+- (void)resetPointerSmoothing {
+    @synchronized (self) {
+        _pendingMoveX = 0.0f;
+        _pendingMoveY = 0.0f;
+        _pendingScroll = 0.0f;
+        _pointerVelocityX = 0.0f;
+        _pointerVelocityY = 0.0f;
+    }
 }
 
 @end

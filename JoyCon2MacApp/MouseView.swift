@@ -23,7 +23,7 @@ struct MouseView: View {
     // is just a mirror and both rows get updated together when the user
     // changes the picker.
     private var mouseMode: MouseMode {
-        daemonBridge.controllers.first?.mouseMode ?? .off
+        daemonBridge.controllers.first?.mouseMode ?? .normal
     }
     private var mouseSource: MouseSource {
         daemonBridge.controllers.first?.mouseSource ?? .auto

@@ -40,7 +40,7 @@ struct JoyConHIDGamepadReport {
 
 struct JoyConHIDMouseReport {
     uint8_t reportId;   // 2
-    uint8_t buttons;    // bits 0/1/2 = left/right/middle
+    uint8_t buttons;    // bits 0..4 = left/right/middle/back/forward
     int16_t x;
     int16_t y;
     int8_t  wheel;
@@ -344,19 +344,19 @@ const uint8_t VirtualMouseDescriptor[] = {
     0x09, 0x01,        //   Usage (Pointer)
     0xA1, 0x00,        //   Collection (Physical)
 
-    // Mouse Buttons (3)
+    // Mouse Buttons (5)
     0x05, 0x09,        //     Usage Page (Button)
     0x19, 0x01,        //     Usage Minimum (1)
-    0x29, 0x03,        //     Usage Maximum (3)
+    0x29, 0x05,        //     Usage Maximum (5)
     0x15, 0x00,        //     Logical Minimum (0)
     0x25, 0x01,        //     Logical Maximum (1)
-    0x95, 0x03,        //     Report Count (3)
+    0x95, 0x05,        //     Report Count (5)
     0x75, 0x01,        //     Report Size (1)
     0x81, 0x02,        //     Input (Data,Var,Abs)
 
-    // Padding (5 bits)
+    // Padding (3 bits)
     0x95, 0x01,        //     Report Count (1)
-    0x75, 0x05,        //     Report Size (5)
+    0x75, 0x03,        //     Report Size (3)
     0x81, 0x03,        //     Input (Const,Var,Abs)
 
     // Mouse X/Y (16-bit relative)
@@ -971,9 +971,9 @@ OSDictionary * VirtualJoyConMouseDevice::newDeviceDescription() {
     OSNumber * product      = OSNumber::withNumber(static_cast<uint32_t>(0x2067), 32);
     OSNumber * version      = OSNumber::withNumber(static_cast<uint32_t>(1), 32);
     OSNumber * location     = OSNumber::withNumber(kVirtualLocationMouse, 32);
-    OSString * transport    = OSString::withCString("Virtual");
+    OSString * transport    = OSString::withCString("Bluetooth");
     OSString * manufacturer = OSString::withCString("JoyCon2Mac");
-    OSString * productName  = OSString::withCString("Joy-Con 2 Mouse (Virtual)");
+    OSString * productName  = OSString::withCString("JoyCon2Mac Bluetooth Mouse");
     OSString * serial       = OSString::withCString("JoyCon2Mac-Mouse-01");
 
     if (vendor)       { description->setObject(kIOHIDVendorIDKey,       vendor);       vendor->release(); }
@@ -1211,7 +1211,11 @@ static kern_return_t ensureAllHIDDevices(VirtualJoyConUserClient * self) {
         return kIOReturnBadArgument;
     }
     if (self->ivars->sdlOnlyMode) {
-        return ensureDualSenseDevice(self);
+        kern_return_t kr = ensureDualSenseDevice(self);
+        if (kr != kIOReturnSuccess) {
+            return kr;
+        }
+        return ensureMouseDevice(self);
     }
 
     kern_return_t kr = ensureGamepadDevice(self);
@@ -1276,9 +1280,6 @@ static kern_return_t PostMouseReport(OSObject * target, void * reference, IOUser
     VirtualJoyConUserClient * client = OSDynamicCast(VirtualJoyConUserClient, target);
     if (!client || !arguments || !arguments->structureInput) {
         return kIOReturnBadArgument;
-    }
-    if (client->ivars && client->ivars->sdlOnlyMode) {
-        return kIOReturnSuccess;
     }
     kern_return_t kr = ensureMouseDevice(client);
     if (kr != kIOReturnSuccess) {
@@ -1369,7 +1370,10 @@ static kern_return_t SetHIDMode(OSObject * target, void * reference, IOUserClien
 
     if (sdlOnly) {
         releaseGamepadDevice(client);
-        releaseMouseDevice(client);
+        kr = ensureMouseDevice(client);
+        if (kr != kIOReturnSuccess) {
+            return kr;
+        }
         os_log(OS_LOG_DEFAULT, "VirtualJoyConUserClient: HID mode set to SDL-only");
         return kIOReturnSuccess;
     }

@@ -76,8 +76,12 @@ static JoyConReportData g_lastGamepadReport = {};
 static bool g_haveLastGamepadReport = false;
 static bool g_findLeftActive = false;
 static bool g_findRightActive = false;
-static int g_findShakeHitsLeft = 0;
-static int g_findShakeHitsRight = 0;
+static CFAbsoluteTime g_findShakeStartLeft = 0;
+static CFAbsoluteTime g_findShakeStartRight = 0;
+static MotionData g_findLastMotionLeft = {0, 0, 0, 0, 0, 0};
+static MotionData g_findLastMotionRight = {0, 0, 0, 0, 0, 0};
+static bool g_findHaveLastMotionLeft = false;
+static bool g_findHaveLastMotionRight = false;
 static std::string g_railBindingLeftSL = "none";
 static std::string g_railBindingLeftSR = "none";
 static std::string g_railBindingRightSL = "none";
@@ -299,8 +303,10 @@ static void applySDLOnlyMode(bool enabled) {
 static void applyFindJoyConMode(bool leftActive, bool rightActive, const char *reason) {
     g_findLeftActive = leftActive;
     g_findRightActive = rightActive;
-    if (!leftActive) g_findShakeHitsLeft = 0;
-    if (!rightActive) g_findShakeHitsRight = 0;
+    g_findShakeStartLeft = 0;
+    g_findShakeStartRight = 0;
+    g_findHaveLastMotionLeft = false;
+    g_findHaveLastMotionRight = false;
 
     if (g_bleManager) {
         [g_bleManager setFindModeLeft:leftActive ? YES : NO
@@ -316,19 +322,45 @@ static void applyFindJoyConMode(bool leftActive, bool rightActive, const char *r
 
 static void updateFindShakeStop(JoyConSide side, const MotionData& motion) {
     bool *active = side == JoyConSide::Right ? &g_findRightActive : &g_findLeftActive;
-    int *hits = side == JoyConSide::Right ? &g_findShakeHitsRight : &g_findShakeHitsLeft;
+    CFAbsoluteTime *shakeStart = side == JoyConSide::Right ? &g_findShakeStartRight : &g_findShakeStartLeft;
+    MotionData *lastMotion = side == JoyConSide::Right ? &g_findLastMotionRight : &g_findLastMotionLeft;
+    bool *haveLastMotion = side == JoyConSide::Right ? &g_findHaveLastMotionRight : &g_findHaveLastMotionLeft;
     if (!*active) {
+        *haveLastMotion = false;
+        *shakeStart = 0;
         return;
     }
 
-    float gyroEnergy = std::fabs(motion.gyroX) + std::fabs(motion.gyroY) + std::fabs(motion.gyroZ);
-    if (gyroEnergy > 180.0f) {
-        (*hits)++;
-    } else if (*hits > 0) {
-        (*hits)--;
+    float gyroMagnitude = std::sqrt(motion.gyroX * motion.gyroX +
+                                    motion.gyroY * motion.gyroY +
+                                    motion.gyroZ * motion.gyroZ);
+    float accelMagnitude = std::sqrt(motion.accelX * motion.accelX +
+                                     motion.accelY * motion.accelY +
+                                     motion.accelZ * motion.accelZ);
+    float accelJerk = 0.0f;
+    if (*haveLastMotion) {
+        float deltaX = motion.accelX - lastMotion->accelX;
+        float deltaY = motion.accelY - lastMotion->accelY;
+        float deltaZ = motion.accelZ - lastMotion->accelZ;
+        accelJerk = std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
+    }
+    *lastMotion = motion;
+    *haveLastMotion = true;
+
+    bool strongShake = gyroMagnitude > 125.0f || accelJerk > 0.45f || std::fabs(accelMagnitude - 1.0f) > 0.55f;
+    bool mediumShake = gyroMagnitude > 70.0f && accelJerk > 0.18f;
+    const bool shaking = strongShake || mediumShake;
+    if (!shaking) {
+        *shakeStart = 0;
+        return;
     }
 
-    if (*hits < 5) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (*shakeStart == 0) {
+        *shakeStart = now;
+        return;
+    }
+    if ((now - *shakeStart) < 1.0) {
         return;
     }
 
@@ -868,12 +900,28 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         uint32_t rightButtonsForReport = g_state.rightButtons;
         StickData leftStickForReport   = g_state.leftStick;
         StickData rightStickForReport  = g_state.rightStick;
+        uint8_t triggerLForReport = g_state.triggerL;
+        uint8_t triggerRForReport = g_state.triggerR;
         if (side == JoyConSide::Left) {
             leftButtonsForReport = sideButtonsForGamepad;
             leftStickForReport   = sideStickForGamepad;
         } else {
             rightButtonsForReport = sideButtonsForGamepad;
             rightStickForReport   = sideStickForGamepad;
+        }
+
+        // When mouse mode owns a Joy-Con on a surface, remove that half from
+        // the virtual controller entirely. Lifting it rejoins the pair because
+        // isSideMouseOwned flips false as soon as distance becomes non-zero.
+        if (g_mouseEmitter && [g_mouseEmitter isSideMouseOwned:JoyConSide::Left]) {
+            leftButtonsForReport = 0;
+            leftStickForReport = { 0, 0, 0, 0 };
+            triggerLForReport = 0;
+        }
+        if (g_mouseEmitter && [g_mouseEmitter isSideMouseOwned:JoyConSide::Right]) {
+            rightButtonsForReport = 0;
+            rightStickForReport = { 0, 0, 0, 0 };
+            triggerRForReport = 0;
         }
 
         applyRailBindingsToReport(leftButtonsForReport, rightButtonsForReport);
@@ -895,8 +943,8 @@ void onJoyConData(const std::vector<uint8_t>& buffer, JoyConSide side) {
         report.stickLY = leftStickForReport.y;
         report.stickRX = rightStickForReport.x;
         report.stickRY = rightStickForReport.y;
-        report.triggerL = g_state.triggerL;
-        report.triggerR = g_state.triggerR;
+        report.triggerL = triggerLForReport;
+        report.triggerR = triggerRForReport;
         g_lastGamepadReport = report;
         g_haveLastGamepadReport = true;
 
@@ -1051,7 +1099,7 @@ int main(int argc, const char * argv[]) {
             applySDLOnlyMode(g_sdlOnlyMode);
         } else {
             std::cout << "✗ Failed to connect to DriverKit Extension\n";
-            emitDaemonEvent("driverMissing", "VirtualJoyConDriver not loaded; using CGEvent mouse fallback only");
+            emitDaemonEvent("driverMissing", "VirtualJoyConDriver not loaded; HID mouse output unavailable");
         }
         g_mouseEmitter = [[MouseEmitter alloc] initWithDriverClient:g_driverClient];
 
