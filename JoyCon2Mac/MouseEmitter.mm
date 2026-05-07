@@ -31,8 +31,6 @@
 @property (nonatomic, assign) float pendingMoveX;
 @property (nonatomic, assign) float pendingMoveY;
 @property (nonatomic, assign) float pendingScroll;
-@property (nonatomic, assign) float pointerVelocityX;
-@property (nonatomic, assign) float pointerVelocityY;
 @property (nonatomic, strong) dispatch_queue_t pointerQueue;
 @property (nonatomic, strong) dispatch_source_t pointerTimer;
 
@@ -81,22 +79,16 @@
 
 static const uint64_t kPointerTimerIntervalNanos = 8333333ULL; // 1 / 120 s
 
-static int RoundedTimerPointerStep(float filtered, float pending) {
-    if (std::fabs(pending) < 0.75f && std::fabs(filtered) < 0.75f) {
+static int RoundedTimerPointerStep(float pending, float threshold) {
+    if (std::fabs(pending) < threshold) {
         return 0;
     }
 
-    int step = static_cast<int>(std::lrintf(filtered));
-    if (step == 0 && std::fabs(pending) >= 1.0f) {
+    int step = static_cast<int>(std::lrintf(pending));
+    if (step == 0) {
         step = pending > 0.0f ? 1 : -1;
     }
-
-    int maxStep = static_cast<int>(std::floor(std::fabs(pending)));
-    maxStep = std::clamp(maxStep, 0, 64);
-    if (maxStep == 0) {
-        return 0;
-    }
-    return std::clamp(step, -maxStep, maxStep);
+    return std::clamp(step, -512, 512);
 }
 
 static int16_t ClampMouseDelta(int value) {
@@ -131,8 +123,6 @@ static int8_t ClampMouseWheel(int value) {
         _pendingMoveX = 0.0f;
         _pendingMoveY = 0.0f;
         _pendingScroll = 0.0f;
-        _pointerVelocityX = 0.0f;
-        _pointerVelocityY = 0.0f;
         _leftBtnPressed = NO;
         _rightBtnPressed = NO;
         _middleBtnPressed = NO;
@@ -535,8 +525,6 @@ static int8_t ClampMouseWheel(int value) {
             _pendingMoveX = 0.0f;
             _pendingMoveY = 0.0f;
             _pendingScroll = 0.0f;
-            _pointerVelocityX = 0.0f;
-            _pointerVelocityY = 0.0f;
             return;
         }
 
@@ -548,36 +536,19 @@ static int8_t ClampMouseWheel(int value) {
         }
 
         if (pendingDistance < 0.35f &&
-            std::fabs(_pointerVelocityX) < 0.35f &&
-            std::fabs(_pointerVelocityY) < 0.35f &&
             outScroll == 0) {
             return;
         }
 
-        float releaseFactor = 0.34f;
-        if (pendingDistance > 40.0f) {
-            releaseFactor = 0.58f;
-        } else if (pendingDistance > 16.0f) {
-            releaseFactor = 0.48f;
-        } else if (pendingDistance > 5.0f) {
-            releaseFactor = 0.40f;
-        }
-
-        float targetX = _pendingMoveX * releaseFactor;
-        float targetY = _pendingMoveY * releaseFactor;
-        _pointerVelocityX = _pointerVelocityX * 0.26f + targetX * 0.74f;
-        _pointerVelocityY = _pointerVelocityY * 0.26f + targetY * 0.74f;
-
-        outX = RoundedTimerPointerStep(_pointerVelocityX, _pendingMoveX);
-        outY = RoundedTimerPointerStep(_pointerVelocityY, _pendingMoveY);
+        float axisThreshold = pendingDistance >= 0.75f ? 0.50f : 0.75f;
+        outX = RoundedTimerPointerStep(_pendingMoveX, axisThreshold);
+        outY = RoundedTimerPointerStep(_pendingMoveY, axisThreshold);
         if (outX == 0 && outY == 0 && outScroll == 0) {
             return;
         }
 
         _pendingMoveX -= outX;
         _pendingMoveY -= outY;
-        _pointerVelocityX -= outX;
-        _pointerVelocityY -= outY;
     }
 
     [self postMouseReportDeltaX:outX deltaY:outY scroll:outScroll];
@@ -622,8 +593,6 @@ static int8_t ClampMouseWheel(int value) {
         _pendingMoveX = 0.0f;
         _pendingMoveY = 0.0f;
         _pendingScroll = 0.0f;
-        _pointerVelocityX = 0.0f;
-        _pointerVelocityY = 0.0f;
     }
 }
 
